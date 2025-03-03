@@ -33,11 +33,12 @@ export default function Home() {
           </CardHeader>
           <CardContent>
             <ul className="space-y-2 list-disc list-inside text-sm text-muted-foreground">
-              <li>Click on a cell to add energy (or use the Random Reaction button)</li>
-              <li>A cell with energy `&gt;` 1 will explode, sending energy to adjacent cells</li>
+              <li>Click anywhere to add energy to atoms (or use the Random Reaction button)</li>
+              <li>An atom with energy `&gt;` 1 will explode, sending energy to adjacent atoms</li>
+              <li>When atoms collide, they can trigger additional chain reactions</li>
               <li>Every explosion is recorded on the Somnia blockchain</li>
-              <li>The simulation runs continuously until all cells stabilize or decay</li>
-              <li>Cells decay after reaching 50 energy</li>
+              <li>The simulation runs continuously until all atoms stabilize or decay</li>
+              <li>Atoms decay after reaching 50 energy</li>
               <li>Watch the transaction log to see blockchain activity in real-time</li>
             </ul>
           </CardContent>

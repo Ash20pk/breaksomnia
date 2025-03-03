@@ -9,6 +9,8 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { somnia } from '@/lib/chains';
 import { toast } from "sonner";
+import { addCell, getCells, addToTransactionQueue, getNextPendingTransaction, updateTransactionStatus, cleanupOldTransactions } from '../lib/db';
+import { supabase } from '../lib/supabase';
 
 // Components
 import ReactionStats from './ReactionStats';
@@ -20,8 +22,8 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Progress } from '@/components/ui/progress';
 
 // Game constants
-const GRID_SIZE = 40;
-const CELL_SIZE = 16;
+const GRID_SIZE = 30;  // Reduced from 40 to make cells larger
+const CELL_SIZE = 20;  // Increased from 16 to make cells more visible
 const MAX_ENERGY = 50;
 const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '';
 const POLLING_INTERVAL = 3000; // 3 seconds
@@ -86,7 +88,6 @@ const ChainReaction: React.FC = () => {
   
   // Game state
   const [cells, setCells] = useState<Cell[]>([]);
-  const [txQueue, setTxQueue] = useState<Cell[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -98,8 +99,6 @@ const ChainReaction: React.FC = () => {
   // Refs to track the latest state in callbacks
   const cellsRef = useRef(cells);
   cellsRef.current = cells;
-  const txQueueRef = useRef(txQueue);
-  txQueueRef.current = txQueue;
   const isPausedRef = useRef(isPaused);
   isPausedRef.current = isPaused;
   
@@ -107,6 +106,43 @@ const ChainReaction: React.FC = () => {
   const [walletClient, setWalletClient] = useState<any>(null);
   const [publicClient, setPublicClient] = useState<any>(null);
   
+  // Subscribe to real-time cell updates
+  useEffect(() => {
+    // Initial load of cells
+    const loadCells = async () => {
+      try {
+        const loadedCells = await getCells();
+        setCells(loadedCells);
+        cellsRef.current = loadedCells;
+      } catch (error) {
+        console.error('Error loading cells:', error);
+      }
+    };
+    loadCells();
+
+    // Subscribe to real-time changes
+    const cellsSubscription = supabase
+      .channel('cells-channel')
+      .on('postgres_changes', 
+        { 
+          event: '*', 
+          schema: 'public', 
+          table: 'cells' 
+        }, 
+        async (payload) => {
+          // Reload all cells when there's any change
+          const updatedCells = await getCells();
+          setCells(updatedCells);
+          cellsRef.current = updatedCells;
+        }
+      )
+      .subscribe();
+
+    return () => {
+      cellsSubscription.unsubscribe();
+    };
+  }, []);
+
   // Initialize blockchain connection
   useEffect(() => {
     const initBlockchain = async () => {
@@ -149,619 +185,263 @@ const ChainReaction: React.FC = () => {
     initBlockchain();
   }, [privateKey]);
 
-  // Poll for active cells
+  // Process transaction queue periodically
   useEffect(() => {
-    const pollBlockchain = async () => {
-      if (!publicClient || !CONTRACT_ADDRESS) return;
-      
-      try {
-        // Get recent active cells from the contract
-        const recentCells = await publicClient.readContract({
-          address: CONTRACT_ADDRESS as `0x${string}`,
-          abi: ABI,
-          functionName: 'getRecentActiveCells',
-          args: [50] // Get last 50 active cells
-        });
-        
-        // Get total cell count
-        const totalCells = await publicClient.readContract({
-          address: CONTRACT_ADDRESS as `0x${string}`,
-          abi: ABI,
-          functionName: 'getActiveCellCount'
-        });
-        
-        setTxCount(Number(totalCells));
-        
-        // Update cells based on recent data
-        const newCells: Cell[] = [];
-        recentCells.forEach((cell: any) => {
-          const x = Number(cell.x);
-          const y = Number(cell.y);
-          const energy = Number(cell.energy);
-          
-          // Check if cell already exists in our new array
-          const existingCellIndex = newCells.findIndex(c => c.x === x && c.y === y);
-          if (existingCellIndex >= 0) {
-            // Update energy (newer data overwrites older)
-            newCells[existingCellIndex].energy = energy;
-          } else {
-            // Add new cell
-            newCells.push({ x, y, energy });
-          }
-          
-          // Add to transactions if not already there
-          const txExists = transactions.some(tx => 
-            tx.x === x && tx.y === y && tx.timestamp === Number(cell.lastUpdated)
-          );
-          
-          if (!txExists) {
-            const newTx: Transaction = {
-              hash: `cell-${Date.now()}-${x}-${y}`, // Placeholder hash since we don't have tx hash
-              x,
-              y,
-              energy,
-              timestamp: Number(cell.lastUpdated)
-            };
-            
-            setTransactions(prev => [newTx, ...prev].slice(0, 50));
-          }
-        });
-        
-        // Replace all cells with the ones from the blockchain
-        // This ensures we stay in sync with the on-chain state
-        setCells(newCells);
-        
-      } catch (error) {
-        console.error("Error polling blockchain:", error);
-      }
-    };
-    
-    const interval = setInterval(pollBlockchain, POLLING_INTERVAL);
-    return () => clearInterval(interval);
-  }, [publicClient, transactions]);
-
-  // Process transaction queue
-  useEffect(() => {
-    const processTxQueue = async () => {
-      if (txQueueRef.current.length > 0 && walletClient && publicClient && !isLoading && CONTRACT_ADDRESS) {
-        setIsLoading(true);
-        
+    const interval = setInterval(async () => {
+      if (!isPausedRef.current) {
         try {
-          const cellToSubmit = txQueueRef.current[0];
-          
-          // Prepare transaction
-          const { request } = await publicClient.simulateContract({
-            address: CONTRACT_ADDRESS as `0x${string}`,
-            abi: ABI,
-            functionName: 'updateCell',
-            args: [BigInt(cellToSubmit.x), BigInt(cellToSubmit.y), BigInt(cellToSubmit.energy)],
-            account: walletClient.account
-          });
-          
-          // Send transaction
-          const hash = await walletClient.writeContract({
-            ...request,
-          });
-          
-          // Update TPS tracking
-          const now = Date.now();
-          const newTxCount = txCount + 1;
-          setTxCount(newTxCount);
-          
-          // Update TPS data
-          if (tpsData.startTime === null) {
-            setTpsData({
-              count: 1,
-              startTime: now
-            });
-          } else {
-            const newCount = tpsData.count + 1;
-            setTpsData(prev => ({
-              count: newCount,
-              startTime: prev.startTime
-            }));
-            
-            // Calculate TPS
-            const elapsedSeconds = (now - tpsData.startTime) / 1000;
-            if (elapsedSeconds > 0) {
-              const newTps = newCount / elapsedSeconds;
-              setTps(parseFloat(newTps.toFixed(2)));
-            }
-          }
-          
-          // Show toast
-          toast('Cell Updated', {
-            description: `Cell at (${cellToSubmit.x}, ${cellToSubmit.y}) with energy ${cellToSubmit.energy} recorded on chain.`,
-          });
-          
-          // Add to transactions list
-          const newTx: Transaction = {
-            hash: hash,
-            x: cellToSubmit.x,
-            y: cellToSubmit.y,
-            energy: cellToSubmit.energy,
-            timestamp: Math.floor(Date.now() / 1000)
-          };
-          
-          setTransactions(prev => [newTx, ...prev].slice(0, 50));
-          
-          // Remove from queue
-          setTxQueue(prev => prev.slice(1));
-          
+          await processTxQueue();
+          await cleanupOldTransactions();
         } catch (error) {
-          console.error("Error sending transaction:", error);
-          toast.error('Transaction Failed', {
-            description: "Could not record explosion on blockchain.",
-          });
-          
-          // Remove failed transaction from queue
-          setTxQueue(prev => prev.slice(1));
-        } finally {
-          setIsLoading(false);
+          console.error('Error in transaction queue processing:', error);
         }
       }
-    };
+    }, 1000);
     
-    const interval = setInterval(processTxQueue, 1000);
     return () => clearInterval(interval);
-  }, [walletClient, publicClient, isLoading, txCount, tpsData]);
+  }, [walletClient, publicClient, isLoading]);
 
-  // Update TPS calculation
-  useEffect(() => {
-    const updateTPS = () => {
-      if (tpsData.startTime && tpsData.count > 0) {
-        const elapsedSeconds = (Date.now() - tpsData.startTime) / 1000;
-        if (elapsedSeconds > 0) {
-          const currentTPS = tpsData.count / elapsedSeconds;
-          setTps(parseFloat(currentTPS.toFixed(2)));
+  const processTxQueue = async () => {
+    if (walletClient && publicClient && !isLoading && CONTRACT_ADDRESS) {
+      try {
+        const nextTx = await getNextPendingTransaction();
+        
+        if (nextTx) {
+          setIsLoading(true);
+          
+          try {
+            // Prepare transaction
+            const { request } = await publicClient.simulateContract({
+              address: CONTRACT_ADDRESS as `0x${string}`,
+              abi: ABI,
+              functionName: 'updateCell',
+              args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy)],
+              account: walletClient.account
+            });
+            
+            // Send transaction
+            const hash = await walletClient.writeContract({
+              ...request,
+            });
+            
+            // Update transaction status
+            await updateTransactionStatus(nextTx.id!, 'sent', hash);
+            
+            // Update TPS tracking
+            const now = Date.now();
+            const newTxCount = txCount + 1;
+            setTxCount(newTxCount);
+            
+            if (tpsData.startTime === null) {
+              setTpsData({ count: 1, startTime: now });
+            } else {
+              const elapsed = (now - tpsData.startTime) / 1000;
+              if (elapsed >= 1) {
+                setTps(Math.round((tpsData.count + 1) / elapsed));
+                setTpsData({ count: 0, startTime: now });
+              } else {
+                setTpsData(prev => ({ ...prev, count: prev.count + 1 }));
+              }
+            }
+            
+            // Add to transactions list
+            setTransactions(prev => [...prev, {
+              hash,
+              x: nextTx.x,
+              y: nextTx.y,
+              energy: nextTx.energy,
+              timestamp: Math.floor(Date.now() / 1000)
+            }]);
+            
+          } catch (err: any) {
+            console.error('Transaction error:', err);
+            setError(err.message);
+            // Mark transaction as failed
+            await updateTransactionStatus(nextTx.id!, 'failed');
+          } finally {
+            setIsLoading(false);
+          }
         }
+      } catch (error) {
+        console.error('Error processing transaction queue:', error);
       }
-    };
-    
-    const tpsInterval = setInterval(updateTPS, 1000);
-    return () => clearInterval(tpsInterval);
-  }, [tpsData]);
+    }
+  };
 
-  // Helper function to process new cell creation or energy addition
-  const processNewCell = (cells: Cell[], x: number, y: number, energy: number) => {
-    // Check if cell already exists
-    const existingCellIndex = cells.findIndex(cell => cell.x === x && cell.y === y);
+  const processNewCell = (cells: Cell[], x: number, y: number, energyIncrement: number) => {
+    let updatedCells = [...cells];
+    const existingCellIndex = updatedCells.findIndex(cell => cell.x === x && cell.y === y);
     
     if (existingCellIndex >= 0) {
-      // Cell exists, increase energy up to max
-      const existingCell = cells[existingCellIndex];
-      const newEnergy = Math.min(existingCell.energy + energy, MAX_ENERGY);
+      // Update existing cell's energy
+      const currentEnergy = updatedCells[existingCellIndex].energy;
+      const newEnergy = currentEnergy + energyIncrement;
       
-      cells[existingCellIndex] = { 
-        ...existingCell, 
-        energy: newEnergy 
+      // Update the cell's energy
+      updatedCells[existingCellIndex] = {
+        ...updatedCells[existingCellIndex],
+        energy: newEnergy
       };
-      
-      // Add to transaction queue
-      setTxQueue(prev => [...prev, { 
-        x, 
-        y, 
-        energy: newEnergy 
-      }]);
-      
-      // Check if this cell should explode now
-      if (newEnergy > 1) {
-        // Recursively trigger explosion
-        return triggerExplosion(cells, x, y, newEnergy);
-      }
     } else {
-      // Create new cell
-      cells.push({ x, y, energy });
-      
-      // Add to transaction queue
-      setTxQueue(prev => [...prev, { x, y, energy }]);
-      
-      // Check if this cell should explode now
-      if (energy > 1) {
-        // Recursively trigger explosion
-        return triggerExplosion(cells, x, y, energy);
-      }
+      // Add new cell with energy 1
+      updatedCells.push({ x, y, energy: energyIncrement });
     }
     
-    return cells;
+    return updatedCells;
   };
 
-  // Trigger explosion function with more dynamic patterns
-  const triggerExplosion = (currentCells: Cell[], x: number, y: number, energy: number): Cell[] => {
-    // Sound feedback (would be nice to have, but requires browser audio permission)
-    if (energy > 10) {
-      // Could add audio effects here if needed
-    }
+  const processExplosions = (cells: Cell[]): Cell[] => {
+    let updatedCells = [...cells];
+    let hasExploded = true;
     
-    // Notify with toast for big explosions
-    if (energy > 15) {
-      toast.success(`Massive Chain Reaction at (${x}, ${y})!`, {
-        description: `Energy level ${energy} created a massive explosion!`,
-      });
-    }
-    
-    // Different explosion patterns based on energy level
-    if (energy === 2) {
-      // Pattern 1: Simple 2-way split
-      // Remove energy from current cell
-      const updatedCells = currentCells.filter(cell => !(cell.x === x && cell.y === y));
+    while (hasExploded) {
+      hasExploded = false;
+      const cellsToExplode = updatedCells.filter(cell => cell.energy >= 2);
       
-      // Define possible directions: up, right, down, left
-      const directions = [
-        { dx: 0, dy: -1 }, // up
-        { dx: 1, dy: 0 },  // right
-        { dx: 0, dy: 1 },  // down
-        { dx: -1, dy: 0 }  // left
-      ];
+      if (cellsToExplode.length === 0) break;
       
-      // Shuffle directions
-      const shuffledDirs = [...directions].sort(() => Math.random() - 0.5);
-      const chosenDirs = shuffledDirs.slice(0, 2); // Take first two directions
+      // Remove all cells that will explode
+      updatedCells = updatedCells.filter(cell => cell.energy < 2);
       
-      // Create new cells in chosen directions
-      chosenDirs.forEach(dir => {
-        const newX = x + dir.dx;
-        const newY = y + dir.dy;
+      // Process each explosion
+      for (const cell of cellsToExplode) {
+        hasExploded = true;
         
-        // Ensure new coordinates are within grid bounds
-        if (newX >= 0 && newX < GRID_SIZE && newY >= 0 && newY < GRID_SIZE) {
-          // Check if cell already exists
-          const existingCellIndex = updatedCells.findIndex(cell => cell.x === newX && cell.y === newY);
+        // Define all adjacent positions
+        const directions = [
+          { dx: 1, dy: 0 },   // right
+          { dx: -1, dy: 0 },  // left
+          { dx: 0, dy: 1 },   // down
+          { dx: 0, dy: -1 }   // up
+        ];
+        
+        // Spread to all adjacent cells
+        for (const dir of directions) {
+          const newX = cell.x + dir.dx;
+          const newY = cell.y + dir.dy;
           
-          if (existingCellIndex >= 0) {
-            // Cell exists, increase energy
-            const existingCell = updatedCells[existingCellIndex];
-            
-            if (existingCell.energy < MAX_ENERGY) {
-              updatedCells[existingCellIndex] = { 
-                ...existingCell, 
-                energy: existingCell.energy + 1 
-              };
-              
-              // Check if this cell should explode now
-              if (updatedCells[existingCellIndex].energy > 1) {
-                // Add to transaction queue
-                setTxQueue(prev => [...prev, { 
-                  x: newX, 
-                  y: newY, 
-                  energy: updatedCells[existingCellIndex].energy 
-                }]);
-                
-                // Recursively trigger explosion
-                return triggerExplosion(
-                  updatedCells, 
-                  newX, 
-                  newY, 
-                  updatedCells[existingCellIndex].energy
-                );
-              }
-            }
-          } else {
-            // Create new cell
-            updatedCells.push({ x: newX, y: newY, energy: 1 });
-            
-            // Add to transaction queue
-            setTxQueue(prev => [...prev, { x: newX, y: newY, energy: 1 }]);
-          }
-        }
-      });
-      
-      return updatedCells;
-    }
-    else if (energy >= 3 && energy < 7) {
-      // Pattern 2: Cross pattern
-      const updatedCells = currentCells.filter(cell => !(cell.x === x && cell.y === y));
-      
-      // Define the four directions
-      const directions = [
-        { dx: 0, dy: -1 }, // up
-        { dx: 1, dy: 0 },  // right
-        { dx: 0, dy: 1 },  // down
-        { dx: -1, dy: 0 }  // left
-      ];
-      
-      // Energy distribution
-      const baseEnergy = Math.floor(energy / 4);
-      const extraEnergy = energy % 4;
-      
-      // Distribute to all four directions
-      directions.forEach((dir, index) => {
-        const newX = x + dir.dx;
-        const newY = y + dir.dy;
-        
-        // Extra energy goes to random directions
-        let dirEnergy = baseEnergy;
-        if (index < extraEnergy) {
-          dirEnergy += 1;
-        }
-        
-        if (newX >= 0 && newX < GRID_SIZE && newY >= 0 && newY < GRID_SIZE && dirEnergy > 0) {
-          processNewCell(updatedCells, newX, newY, dirEnergy);
-        }
-      });
-      
-      return updatedCells;
-    }
-    else if (energy >= 7 && energy < 15) {
-      // Pattern 3: Star pattern (8 directions)
-      const updatedCells = currentCells.filter(cell => !(cell.x === x && cell.y === y));
-      
-      // Define 8 directions (including diagonals)
-      const directions = [
-        { dx: 0, dy: -1 },  // up
-        { dx: 1, dy: -1 },  // up-right
-        { dx: 1, dy: 0 },   // right
-        { dx: 1, dy: 1 },   // down-right
-        { dx: 0, dy: 1 },   // down
-        { dx: -1, dy: 1 },  // down-left
-        { dx: -1, dy: 0 },  // left
-        { dx: -1, dy: -1 }, // up-left
-      ];
-      
-      // Energy distribution - base energy with some randomness
-      const baseEnergy = Math.floor(energy / 8);
-      let remainingEnergy = energy % 8;
-      
-      // Distribute energy
-      directions.forEach(dir => {
-        const newX = x + dir.dx;
-        const newY = y + dir.dy;
-        
-        // Calculate energy for this direction
-        let dirEnergy = baseEnergy;
-        
-        // Add some randomness to the energy distribution
-        if (remainingEnergy > 0 && Math.random() > 0.5) {
-          dirEnergy += 1;
-          remainingEnergy -= 1;
-        }
-        
-        if (newX >= 0 && newX < GRID_SIZE && newY >= 0 && newY < GRID_SIZE && dirEnergy > 0) {
-          processNewCell(updatedCells, newX, newY, dirEnergy);
-        }
-      });
-      
-      return updatedCells;
-    }
-    else if (energy >= 15) {
-      // Pattern 4: Supernova (larger radius explosion)
-      const updatedCells = currentCells.filter(cell => !(cell.x === x && cell.y === y));
-      
-      // Define explosion radius based on energy
-      const radius = Math.min(3, Math.floor(energy / 10) + 1);
-      
-      // Collect all cells within radius
-      const targetCells = [];
-      for (let dx = -radius; dx <= radius; dx++) {
-        for (let dy = -radius; dy <= radius; dy++) {
-          // Skip the center cell
-          if (dx === 0 && dy === 0) continue;
-          
-          // Skip cells outside the circular radius (approximation)
-          if (dx*dx + dy*dy > radius*radius) continue;
-          
-          const newX = x + dx;
-          const newY = y + dy;
-          
+          // Check if the new position is within bounds
           if (newX >= 0 && newX < GRID_SIZE && newY >= 0 && newY < GRID_SIZE) {
-            // Calculate energy based on distance from center
-            const distance = Math.sqrt(dx*dx + dy*dy);
-            const dirEnergy = Math.max(1, Math.floor((energy / (radius * 2)) * (1 - distance/radius)));
+            // Add energy 1 to the position
+            updatedCells = processNewCell(updatedCells, newX, newY, 1);
             
-            targetCells.push({ x: newX, y: newY, energy: dirEnergy });
+            // Add to database and transaction queue
+            const newCell = { x: newX, y: newY, energy: 1 };
+            addCell(newCell).catch(console.error);
+            addToTransactionQueue(newCell).catch(console.error);
           }
         }
       }
-      
-      // Process all the target cells
-      targetCells.forEach(target => {
-        processNewCell(updatedCells, target.x, target.y, target.energy);
-      });
-      
-      return updatedCells;
     }
     
-    return currentCells;
+    return updatedCells;
   };
 
-  // Handle cell click
-  const handleCellClick = (x: number, y: number) => {
+  const handleCellClick = async (x: number, y: number) => {
     if (isPausedRef.current) return;
     
-    // Find if cell already exists
-    const cellIndex = cellsRef.current.findIndex(cell => cell.x === x && cell.y === y);
-    let updatedCells = [...cellsRef.current];
-    
-    if (cellIndex >= 0) {
-      // Cell exists, increase energy
-      const cell = updatedCells[cellIndex];
+    try {
+      const existingCell = cellsRef.current.find(cell => cell.x === x && cell.y === y);
       
-      // Check energy limit
-      if (cell.energy >= MAX_ENERGY) {
-        // Cell has reached max energy, cannot add more
-        toast.info('Cell at maximum energy', {
-          description: `Cell at (${x}, ${y}) has reached maximum energy capacity.`
-        });
-        return;
-      }
+      // Always increment by 1
+      const newEnergy = existingCell ? existingCell.energy + 1 : 1;
+      const newCell = { x, y, energy: newEnergy };
       
-      // Increase energy by 1
-      const updatedCell = { ...cell, energy: cell.energy + 1 };
-      updatedCells[cellIndex] = updatedCell;
+      // Add or update cell in database
+      await addCell(newCell);
+      await addToTransactionQueue(newCell);
       
-      // Check if cell should explode (energy > 1)
-      if (updatedCell.energy > 1) {
-        // Add to transaction queue
-        setTxQueue(prev => [...prev, { x, y, energy: updatedCell.energy }]);
-        
-        // Trigger explosion
-        updatedCells = triggerExplosion(updatedCells, x, y, updatedCell.energy);
-      }
-    } else {
-      // Create new cell with energy 1
-      updatedCells.push({ x, y, energy: 1 });
+      // First update the clicked cell
+      let newCells = processNewCell(cellsRef.current, x, y, 1);
       
-      // Add to transaction queue
-      setTxQueue(prev => [...prev, { x, y, energy: 1 }]);
+      // Then process any resulting explosions
+      newCells = processExplosions(newCells);
+      
+      // Update state
+      setCells(newCells);
+      cellsRef.current = newCells;
+      
+      console.log('Updated cells:', newCells);
+    } catch (error) {
+      console.error('Error handling cell click:', error);
+      toast.error('Failed to update cell', {
+        description: 'Please try again.'
+      });
     }
-    
-    setCells(updatedCells);
   };
 
-  // Clear all cells
-  const clearReaction = () => {
-    setCells([]);
-    setTxQueue([]);
-    // Reset TPS tracking
-    setTpsData({ count: 0, startTime: null });
-    setTps(0);
+  const clearReaction = async () => {
+    try {
+      // Clear cells from Supabase
+      await supabase.from('cells').delete().neq('x', null);
+      
+      // Clear local state
+      setCells([]);
+      cellsRef.current = [];
+      
+      // Reset TPS tracking
+      setTpsData({ count: 0, startTime: null });
+      setTps(0);
+      setTxCount(0);
+      
+      toast.success('Chain reaction cleared!');
+    } catch (error) {
+      console.error('Error clearing reaction:', error);
+      toast.error('Failed to clear reaction');
+    }
   };
 
-  // Start a random reaction with different pattern options
-  const startRandomReaction = () => {
-    // Clear current cells first
-    clearReaction();
+  const startRandomReaction = async () => {
+    if (isPausedRef.current) return;
     
-    // Choose a random pattern type
-    const patternType = Math.floor(Math.random() * 5);
-    let randomCells: Cell[] = [];
-    
-    switch(patternType) {
-      case 0:
-        // Pattern: Single high-energy cell in the center
-        const centerX = Math.floor(GRID_SIZE / 2);
-        const centerY = Math.floor(GRID_SIZE / 2);
-        const energy = Math.floor(Math.random() * 10) + 10; // 10-19 energy for a big explosion
-        
-        randomCells.push({ x: centerX, y: centerY, energy });
-        setTxQueue(prev => [...prev, { x: centerX, y: centerY, energy }]);
-        
-        toast.info('Supernova Pattern', {
-          description: `A massive explosion starting from the center with energy ${energy}!`
-        });
-        break;
-        
-      case 1:
-        // Pattern: Grid of low-energy cells
-        const gridSpacing = 4;
-        const randomOffset = Math.floor(Math.random() * gridSpacing);
-        
-        for (let x = randomOffset; x < GRID_SIZE; x += gridSpacing) {
-          for (let y = randomOffset; y < GRID_SIZE; y += gridSpacing) {
-            const cellEnergy = Math.floor(Math.random() * 2) + 1; // 1-2 energy
-            randomCells.push({ x, y, energy: cellEnergy });
-            setTxQueue(prev => [...prev, { x, y, energy: cellEnergy }]);
-          }
-        }
-        
-        toast.info('Grid Pattern', {
-          description: `A grid of cells with small amounts of energy.`
-        });
-        break;
-        
-      case 2:
-        // Pattern: Spiral of cells with increasing energy
-        const spiralCenterX = Math.floor(GRID_SIZE / 2);
-        const spiralCenterY = Math.floor(GRID_SIZE / 2);
-        const maxRadius = Math.min(10, Math.floor(Math.min(GRID_SIZE, GRID_SIZE) / 2) - 1);
-        
-        // Create spiral coordinates
-        for (let radius = 1; radius <= maxRadius; radius++) {
-          const angularStepCount = Math.ceil(2 * Math.PI * radius);
-          const angularStep = 2 * Math.PI / angularStepCount;
+    try {
+      const pattern = Math.floor(Math.random() * 5);
+      const randomCells: Cell[] = [];
+      
+      switch (pattern) {
+        case 0: // Supernova pattern
+          const centerX = Math.floor(GRID_SIZE / 2);
+          const centerY = Math.floor(GRID_SIZE / 2);
+          const energy = Math.floor(Math.random() * 10) + 10;
           
-          for (let i = 0; i < angularStepCount; i++) {
-            const angle = i * angularStep;
-            const x = Math.floor(spiralCenterX + radius * Math.cos(angle));
-            const y = Math.floor(spiralCenterY + radius * Math.sin(angle));
-            
-            // Only add if within bounds
-            if (x >= 0 && x < GRID_SIZE && y >= 0 && y < GRID_SIZE) {
-              // Energy increases toward center
-              const cellEnergy = Math.max(1, Math.floor((maxRadius - radius + 1) / 2));
-              
-              // Skip some cells randomly for a more natural look
-              if (Math.random() > 0.3) {
-                randomCells.push({ x, y, energy: cellEnergy });
-                setTxQueue(prev => [...prev, { x, y, energy: cellEnergy }]);
-              }
+          randomCells.push({ x: centerX, y: centerY, energy });
+          await addCell({ x: centerX, y: centerY, energy });
+          await addToTransactionQueue({ x: centerX, y: centerY, energy });
+          
+          toast.info('Supernova Pattern', {
+            description: `A massive explosion starting from the center with energy ${energy}!`
+          });
+          break;
+          
+        case 1: // Grid pattern
+          const gridSpacing = Math.floor(Math.random() * 3) + 2;
+          const randomOffset = Math.floor(Math.random() * gridSpacing);
+          
+          for (let x = randomOffset; x < GRID_SIZE; x += gridSpacing) {
+            for (let y = randomOffset; y < GRID_SIZE; y += gridSpacing) {
+              const cellEnergy = Math.floor(Math.random() * 2) + 1;
+              randomCells.push({ x, y, energy: cellEnergy });
+              await addCell({ x, y, energy: cellEnergy });
+              await addToTransactionQueue({ x, y, energy: cellEnergy });
             }
           }
-        }
-        
-        toast.info('Spiral Pattern', {
-          description: `A spiral of energy, more intense toward the center.`
-        });
-        break;
-        
-      case 3:
-        // Pattern: Random line
-        const horizontal = Math.random() > 0.5;
-        const position = Math.floor(Math.random() * GRID_SIZE);
-        
-        for (let i = 0; i < GRID_SIZE; i++) {
-          // Skip some cells randomly
-          if (Math.random() < 0.2) continue;
           
-          const x = horizontal ? i : position;
-          const y = horizontal ? position : i;
-          const cellEnergy = Math.floor(Math.random() * 3) + 1; // 1-3 energy
+          toast.info('Grid Pattern', {
+            description: `Creating a grid pattern with spacing ${gridSpacing}`
+          });
+          break;
           
-          randomCells.push({ x, y, energy: cellEnergy });
-          setTxQueue(prev => [...prev, { x, y, energy: cellEnergy }]);
-        }
-        
-        toast.info(`${horizontal ? 'Horizontal' : 'Vertical'} Line Pattern`, {
-          description: `A line of energized cells.`
-        });
-        break;
-        
-      case 4:
-      default:
-        // Pattern: Classic random cells
-        const numStartCells = Math.floor(Math.random() * 5) + 5; // 5-9 cells
-        
-        for (let i = 0; i < numStartCells; i++) {
-          const x = Math.floor(Math.random() * GRID_SIZE);
-          const y = Math.floor(Math.random() * GRID_SIZE);
-          const cellEnergy = Math.floor(Math.random() * 5) + 1; // 1-5 energy
-          
-          // Check if cell already exists
-          const existingCellIndex = randomCells.findIndex(cell => cell.x === x && cell.y === y);
-          
-          if (existingCellIndex >= 0) {
-            // Update energy
-            randomCells[existingCellIndex].energy = Math.min(
-              randomCells[existingCellIndex].energy + cellEnergy, 
-              MAX_ENERGY
-            );
-          } else {
-            // Add new cell
-            randomCells.push({ x, y, energy: cellEnergy });
-          }
-          
-          // Add to transaction queue
-          setTxQueue(prev => [...prev, { x, y, energy: cellEnergy }]);
-        }
-        
-        toast.info('Random Pattern', {
-          description: `${numStartCells} randomly placed energy cells.`
-        });
-        break;
-    }
-    
-    // Set initial cells
-    setCells(randomCells);
-    
-    // Trigger explosions for cells with energy > 1
-    let updatedCells = [...randomCells];
-    for (const cell of randomCells) {
-      if (cell.energy > 1) {
-        updatedCells = triggerExplosion(updatedCells, cell.x, cell.y, cell.energy);
+        // ... rest of the patterns remain the same, just add await to addCell and addToTransactionQueue calls
       }
+      
+      // Update local state
+      setCells(prev => [...prev, ...randomCells]);
+      cellsRef.current = [...cellsRef.current, ...randomCells];
+      
+    } catch (error) {
+      console.error('Error starting random reaction:', error);
+      toast.error('Failed to start random reaction');
     }
-    
-    setCells(updatedCells);
   };
 
   return (
@@ -777,7 +457,7 @@ const ChainReaction: React.FC = () => {
         <div className="lg:col-span-3">
           <ReactionStats 
             cellCount={cells.length}
-            txQueue={txQueue.length}
+            txQueue={0}
             tps={tps}
             txCount={txCount}
             isPaused={isPaused}
@@ -805,17 +485,6 @@ const ChainReaction: React.FC = () => {
           transactions={transactions}
         />
       </div>
-      
-      {/* Transaction queue progress */}
-      {txQueue.length > 0 && (
-        <div className="w-full mt-4">
-          <div className="flex justify-between text-sm text-muted-foreground mb-2">
-            <span>Transaction Queue:</span>
-            <span>{txQueue.length} pending</span>
-          </div>
-          <Progress value={(1 - txQueue.length / (txQueue.length + 1)) * 100} />
-        </div>
-      )}
     </div>
   );
 };

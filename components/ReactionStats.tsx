@@ -71,8 +71,8 @@ const ReactionStats: React.FC<ReactionStatsProps> = ({
             <div className="bg-secondary p-3 rounded-md text-xs text-secondary-foreground mb-4">
               <p className="font-medium mb-1">Chain Reaction Tips:</p>
               <ul className="list-disc list-inside space-y-1">
-                <li>Click cells to add energy</li>
-                <li>Cells with energy &gt; 1 will explode</li>
+                <li>Click anywhere to add energy to atoms</li>
+                <li>Atoms with energy &gt; 1 will explode</li>
                 <li>Try different patterns with the Random button</li>
                 <li>Higher energy creates bigger chain reactions</li>
               </ul>
@@ -80,7 +80,7 @@ const ReactionStats: React.FC<ReactionStatsProps> = ({
           )}
           
           <div className="flex justify-between items-center">
-            <span className="text-muted-foreground">Active Cells:</span>
+            <span className="text-muted-foreground">Active Atoms:</span>
             <Badge variant="secondary" className="text-xl">{cellCount}</Badge>
           </div>
           

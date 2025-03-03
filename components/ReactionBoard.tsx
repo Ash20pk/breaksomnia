@@ -1,6 +1,8 @@
-// components/ChainReaction/ReactionBoard.tsx
-import React, { useRef, useEffect } from 'react';
+'use client';
+import React, { useEffect, useRef, useState } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+// Import Phaser dynamically on the client side only
+import dynamic from 'next/dynamic';
 
 interface Cell {
   x: number;
@@ -16,6 +18,28 @@ interface ReactionBoardProps {
   onCellClick: (x: number, y: number) => void;
 }
 
+// Helper to convert grid position to canvas position
+const gridToCanvas = (gridX: number, gridY: number, gridSize: number, canvasWidth: number, canvasHeight: number) => {
+  const cellWidth = canvasWidth / gridSize;
+  const cellHeight = canvasHeight / gridSize;
+  
+  return {
+    x: gridX * cellWidth + cellWidth / 2,
+    y: gridY * cellHeight + cellHeight / 2
+  };
+};
+
+// Helper to convert canvas position to grid position
+const canvasToGrid = (canvasX: number, canvasY: number, gridSize: number, canvasWidth: number, canvasHeight: number) => {
+  const cellWidth = canvasWidth / gridSize;
+  const cellHeight = canvasHeight / gridSize;
+  
+  return {
+    x: Math.floor(canvasX / cellWidth),
+    y: Math.floor(canvasY / cellHeight)
+  };
+};
+
 const ReactionBoard: React.FC<ReactionBoardProps> = ({
   cells,
   gridSize,
@@ -23,288 +47,364 @@ const ReactionBoard: React.FC<ReactionBoardProps> = ({
   maxEnergy,
   onCellClick
 }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const gameRef = useRef<any>(null);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
+  const [canvasSize, setCanvasSize] = useState({ width: gridSize * cellSize, height: gridSize * cellSize });
+  const phaserSceneRef = useRef<any>(null);
+  const atomsRef = useRef<Map<string, any>>(new Map());
+  const [isClient, setIsClient] = useState(false);
   
-  // Get color based on energy level - more vibrant colors
+  // Set isClient to true when component mounts on client
+  useEffect(() => {
+    setIsClient(true);
+  }, []);
+  
+  // Get color based on energy level
   const getEnergyColor = (energy: number) => {
     // Calculate color based on energy percentage
     const energyPercent = Math.min(energy / maxEnergy, 1);
     
     // More vibrant color palette with 7 distinct zones
     if (energyPercent < 0.15) {
-      // Cool blue
-      return 'rgb(30, 144, 255)';
+      return 0x1E90FF; // Cool blue
     } else if (energyPercent < 0.3) {
-      // Electric blue
-      return 'rgb(0, 191, 255)';
+      return 0x00BFFF; // Electric blue
     } else if (energyPercent < 0.45) {
-      // Bright purple
-      return 'rgb(138, 43, 226)';
+      return 0x8A2BE2; // Bright purple
     } else if (energyPercent < 0.6) {
-      // Hot pink
-      return 'rgb(255, 20, 147)';
+      return 0xFF1493; // Hot pink
     } else if (energyPercent < 0.75) {
-      // Bright red
-      return 'rgb(255, 0, 0)';
+      return 0xFF0000; // Bright red
     } else if (energyPercent < 0.9) {
-      // Bright orange
-      return 'rgb(255, 140, 0)';
+      return 0xFF8C00; // Bright orange
     } else {
-      // Yellow/white hot
-      return 'rgb(255, 215, 0)';
+      return 0xFFD700; // Yellow/white hot
     }
   };
-  
-  // Draw canvas function with improved visuals
-  const draw = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    // Create a dark background with subtle pattern
-    ctx.fillStyle = '#111827';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    
-    // Draw subtle grid pattern
-    ctx.strokeStyle = 'rgba(75, 85, 99, 0.3)';
-    ctx.lineWidth = 0.5;
-    
-    for (let x = 0; x <= gridSize; x++) {
-      ctx.beginPath();
-      ctx.moveTo(x * cellSize, 0);
-      ctx.lineTo(x * cellSize, gridSize * cellSize);
-      ctx.stroke();
-    }
-    
-    for (let y = 0; y <= gridSize; y++) {
-      ctx.beginPath();
-      ctx.moveTo(0, y * cellSize);
-      ctx.lineTo(gridSize * cellSize, y * cellSize);
-      ctx.stroke();
-    }
-    
-    // Add a subtle glow to the entire grid
-    const timestamp = Date.now() / 1000;
-    const glowIntensity = (Math.sin(timestamp * 0.5) * 0.1) + 0.1;
-    ctx.fillStyle = `rgba(66, 153, 225, ${glowIntensity})`;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    
-    // Function to draw particle effect
-    const drawParticles = (x: number, y: number, energy: number, time: number) => {
-      const particleCount = Math.min(energy * 2, 15);
-      for (let i = 0; i < particleCount; i++) {
-        const angle = (i / particleCount) * Math.PI * 2 + time;
-        const distance = (Math.sin(time * 2 + i) * 0.3 + 0.7) * energy * 0.7;
-        const pX = x + cellSize / 2 + Math.cos(angle) * distance;
-        const pY = y + cellSize / 2 + Math.sin(angle) * distance;
-        
-        const size = (Math.sin(time + i * 0.5) * 0.5 + 1.5) * (energy / 10);
-        
-        ctx.fillStyle = getEnergyColor(energy);
-        ctx.beginPath();
-        ctx.arc(pX, pY, size, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    };
-    
-    // Draw cells with cool effects
-    cells.forEach(cell => {
-      const x = cell.x * cellSize;
-      const y = cell.y * cellSize;
-      const energy = cell.energy;
-      const time = Date.now() / 500;
-      
-      // Draw cell glow first (so it's behind the cell)
-      if (energy > 1) {
-        const glowSize = 2 + (energy / maxEnergy) * 10;
-        const pulseSize = Math.sin(time * energy * 0.2) * 2 + glowSize;
-        
-        const glow = ctx.createRadialGradient(
-          x + cellSize / 2, 
-          y + cellSize / 2, 
-          0,
-          x + cellSize / 2, 
-          y + cellSize / 2, 
-          cellSize / 2 + pulseSize
-        );
-        
-        // Get the color for the glow based on energy
-        const baseColor = getEnergyColor(energy);
-        const rgbValues = baseColor.match(/\d+/g);
-        if (rgbValues && rgbValues.length >= 3) {
-          const r = rgbValues[0];
-          const g = rgbValues[1];
-          const b = rgbValues[2];
-          glow.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.8)`);
-          glow.addColorStop(0.4, `rgba(${r}, ${g}, ${b}, 0.3)`);
-          glow.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
-        }
-        
-        ctx.fillStyle = glow;
-        const glowRadius = cellSize + pulseSize * 2;
-        ctx.fillRect(
-          x + cellSize/2 - glowRadius/2, 
-          y + cellSize/2 - glowRadius/2, 
-          glowRadius, 
-          glowRadius
-        );
-        
-        // Add particles for high energy cells
-        if (energy > 5) {
-          drawParticles(x, y, energy, time);
-        }
-      }
-      
-      // Draw cell with rounded corners
-      const cornerRadius = 2;
-      ctx.fillStyle = getEnergyColor(energy);
-      ctx.beginPath();
-      ctx.moveTo(x + cornerRadius, y);
-      ctx.lineTo(x + cellSize - cornerRadius, y);
-      ctx.quadraticCurveTo(x + cellSize, y, x + cellSize, y + cornerRadius);
-      ctx.lineTo(x + cellSize, y + cellSize - cornerRadius);
-      ctx.quadraticCurveTo(x + cellSize, y + cellSize, x + cellSize - cornerRadius, y + cellSize);
-      ctx.lineTo(x + cornerRadius, y + cellSize);
-      ctx.quadraticCurveTo(x, y + cellSize, x, y + cellSize - cornerRadius);
-      ctx.lineTo(x, y + cornerRadius);
-      ctx.quadraticCurveTo(x, y, x + cornerRadius, y);
-      ctx.closePath();
-      ctx.fill();
-      
-      // Add a subtle inner gradient to the cell
-      const innerGradient = ctx.createRadialGradient(
-        x + cellSize * 0.7, 
-        y + cellSize * 0.3, 
-        cellSize * 0.1,
-        x + cellSize * 0.5, 
-        y + cellSize * 0.5, 
-        cellSize
-      );
-      
-      const baseColor = getEnergyColor(energy);
-      const rgbValues = baseColor.match(/\d+/g);
-      if (rgbValues && rgbValues.length >= 3) {
-        const r = parseInt(rgbValues[0]);
-        const g = parseInt(rgbValues[1]);
-        const b = parseInt(rgbValues[2]);
-        innerGradient.addColorStop(0, `rgba(255, 255, 255, 0.3)`);
-        innerGradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0.1)`);
-      }
-      
-      ctx.fillStyle = innerGradient;
-      ctx.beginPath();
-      ctx.moveTo(x + cornerRadius, y);
-      ctx.lineTo(x + cellSize - cornerRadius, y);
-      ctx.quadraticCurveTo(x + cellSize, y, x + cellSize, y + cornerRadius);
-      ctx.lineTo(x + cellSize, y + cellSize - cornerRadius);
-      ctx.quadraticCurveTo(x + cellSize, y + cellSize, x + cellSize - cornerRadius, y + cellSize);
-      ctx.lineTo(x + cornerRadius, y + cellSize);
-      ctx.quadraticCurveTo(x, y + cellSize, x, y + cellSize - cornerRadius);
-      ctx.lineTo(x, y + cornerRadius);
-      ctx.quadraticCurveTo(x, y, x + cornerRadius, y);
-      ctx.closePath();
-      ctx.fill();
-      
-      // Draw energy number with better font and shadow
-      ctx.fillStyle = 'white';
-      ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
-      ctx.shadowBlur = 3;
-      ctx.font = `bold ${Math.min(10 + energy/5, 14)}px Arial`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(energy.toString(), x + cellSize / 2, y + cellSize / 2);
-      ctx.shadowBlur = 0;  // Reset shadow
-    });
-    
-    // Draw connections between high energy cells
-    const highEnergyCells = cells.filter(cell => cell.energy > 3);
-    ctx.globalAlpha = 0.3;
-    for (let i = 0; i < highEnergyCells.length; i++) {
-      for (let j = i + 1; j < highEnergyCells.length; j++) {
-        const cell1 = highEnergyCells[i];
-        const cell2 = highEnergyCells[j];
-        
-        // Only connect nearby cells
-        const dx = cell1.x - cell2.x;
-        const dy = cell1.y - cell2.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        
-        if (distance < 8) {
-          const x1 = cell1.x * cellSize + cellSize / 2;
-          const y1 = cell1.y * cellSize + cellSize / 2;
-          const x2 = cell2.x * cellSize + cellSize / 2;
-          const y2 = cell2.y * cellSize + cellSize / 2;
-          
-          // Create gradient for connection line
-          const gradient = ctx.createLinearGradient(x1, y1, x2, y2);
-          gradient.addColorStop(0, getEnergyColor(cell1.energy));
-          gradient.addColorStop(1, getEnergyColor(cell2.energy));
-          
-          // Draw line with varying width based on energy
-          const lineWidth = Math.min((cell1.energy + cell2.energy) / 30, 2);
-          ctx.strokeStyle = gradient;
-          ctx.lineWidth = lineWidth;
-          
-          // Add pulsing effect
-          const pulseIntensity = Math.sin(Date.now() / 200) * 0.5 + 0.5;
-          
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.globalAlpha = 0.2 + pulseIntensity * 0.3;
-          ctx.stroke();
-        }
-      }
-    }
-    ctx.globalAlpha = 1;
-  };
-  
-  // Handle canvas click
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    
-    const x = Math.floor((e.clientX - rect.left) * scaleX / cellSize);
-    const y = Math.floor((e.clientY - rect.top) * scaleY / cellSize);
-    
-    // Ensure within grid bounds
-    if (x >= 0 && x < gridSize && y >= 0 && y < gridSize) {
-      onCellClick(x, y);
-    }
-  };
-  
-  // Animation loop
+
+  // Create and configure Phaser game
   useEffect(() => {
-    let animationFrameId: number;
+    if (!isClient || !canvasContainerRef.current) return;
     
-    const animate = () => {
-      draw();
-      animationFrameId = window.requestAnimationFrame(animate);
+    // Dynamically import Phaser only on the client side
+    const initPhaser = async () => {
+      const Phaser = (await import('phaser')).default;
+      
+      // Determine canvas size based on container
+      const containerWidth = canvasContainerRef.current?.clientWidth || gridSize * cellSize;
+      const containerHeight = containerWidth * (gridSize * cellSize) / (gridSize * cellSize);
+      setCanvasSize({ width: containerWidth, height: containerHeight });
+      
+      // Phaser configuration
+      const config: any = {
+        type: Phaser.AUTO,
+        width: containerWidth,
+        height: containerHeight,
+        parent: canvasContainerRef.current,
+        transparent: true,
+        physics: {
+          default: 'matter',
+          matter: {
+            gravity: { y: 0 },
+            debug: false,
+            setBounds: true
+          }
+        },
+        scene: {
+          create: function(this: any) {
+            // Store reference to the scene
+            phaserSceneRef.current = this;
+            
+            // Add subtle particle background for cosmic effect
+            const particles = this.add.particles(0, 0, 'particle', {
+              alpha: { start: 0, end: 0.1 },
+              scale: { start: 0.5, end: 0 },
+              speed: 20,
+              lifespan: 2000,
+              blendMode: 'ADD',
+              emitting: true,
+              quantity: 1,
+              emitZone: { 
+                type: 'random', 
+                source: new Phaser.Geom.Rectangle(0, 0, containerWidth, containerHeight) 
+              }
+            });
+
+            // Handle clicks on the canvas
+            this.input.on('pointerdown', (pointer: any) => {
+              const { x, y } = canvasToGrid(
+                pointer.x, 
+                pointer.y, 
+                gridSize, 
+                containerWidth, 
+                containerHeight
+              );
+              
+              // Ensure within grid bounds
+              if (x >= 0 && x < gridSize && y >= 0 && y < gridSize) {
+                onCellClick(x, y);
+              }
+            });
+            
+            // Create connections between atoms
+            this.matter.world.on('afterupdate', () => {
+              // We'll implement the connections in updateAtoms
+            });
+          },
+          preload: function(this: any) {
+            // Generate a circular particle
+            const graphics = this.make.graphics({ x: 0, y: 0 });
+            graphics.fillStyle(0xffffff);
+            graphics.fillCircle(8, 8, 8);
+            graphics.generateTexture('particle', 16, 16);
+          }
+        }
+      };
+      
+      // Create the game
+      if (!gameRef.current) {
+        gameRef.current = new Phaser.Game(config);
+      }
     };
     
-    animate();
+    initPhaser();
+    
+    // Cleanup on unmount
+    return () => {
+      if (gameRef.current) {
+        gameRef.current.destroy(true);
+        gameRef.current = null;
+      }
+    };
+  }, [isClient, gridSize, cellSize]);
+  
+  // Update the atoms whenever cells change
+  useEffect(() => {
+    if (!isClient || !phaserSceneRef.current) return;
+    
+    const updateAtoms = async () => {
+      const Phaser = (await import('phaser')).default;
+      const scene = phaserSceneRef.current;
+      if (!scene) return;
+      
+      const currentAtomKeys = new Set<string>();
+      
+      // Update or create atoms for each cell
+      cells.forEach(cell => {
+        const atomKey = `${cell.x}-${cell.y}`;
+        currentAtomKeys.add(atomKey);
+        
+        const canvasPos = gridToCanvas(
+          cell.x, 
+          cell.y, 
+          gridSize, 
+          canvasSize.width, 
+          canvasSize.height
+        );
+        
+        if (atomsRef.current.has(atomKey)) {
+          // Update existing atom
+          const atom = atomsRef.current.get(atomKey);
+          if (atom) {
+            // Update energy text
+            const energyText = atom.getAt(1);
+            energyText.setText(cell.energy.toString());
+            
+            // Update atom appearance based on energy
+            const atomCircle = atom.getAt(0);
+            atomCircle.clear();
+            const color = getEnergyColor(cell.energy);
+            atomCircle.fillStyle(color, 1);
+            
+            // Size based on energy (with a minimum size)
+            const size = Math.max(10, Math.min(30, 10 + cell.energy * 0.8));
+            atomCircle.fillCircle(0, 0, size);
+            
+            // Add glow if high energy
+            if (cell.energy > 1) {
+              atomCircle.fillStyle(color, 0.3);
+              atomCircle.fillCircle(0, 0, size + 5);
+              
+              if (cell.energy > 3) {
+                atomCircle.fillStyle(color, 0.1);
+                atomCircle.fillCircle(0, 0, size + 10);
+              }
+            }
+            
+            // If it's about to explode (energy >= 2), make it pulse
+            if (cell.energy >= 2) {
+              scene.tweens.add({
+                targets: atom,
+                scaleX: 1.2,
+                scaleY: 1.2,
+                duration: 300,
+                yoyo: true,
+                repeat: -1,
+                ease: 'Sine.easeInOut'
+              });
+            } else {
+              // Stop any existing pulse animation
+              scene.tweens.killTweensOf(atom);
+              atom.setScale(1);
+            }
+            
+            // Apply some random motion to make it feel alive
+            const body = atom.body;
+            if (body) {
+              const force = {
+                x: (Math.random() - 0.5) * 0.0001 * cell.energy, 
+                y: (Math.random() - 0.5) * 0.0001 * cell.energy
+              };
+              scene.matter.body.applyForce(body, { x: body.position.x, y: body.position.y }, force);
+            }
+          }
+        } else {
+          // Create new atom
+          const color = getEnergyColor(cell.energy);
+          
+          // Create a container for the atom
+          const atomContainer = scene.add.container(canvasPos.x, canvasPos.y);
+          
+          // Create the atom circle
+          const size = Math.max(10, Math.min(30, 10 + cell.energy * 0.8));
+          const atomCircle = scene.add.graphics();
+          atomCircle.fillStyle(color, 1);
+          atomCircle.fillCircle(0, 0, size);
+          
+          // Add glow if high energy
+          if (cell.energy > 1) {
+            atomCircle.fillStyle(color, 0.3);
+            atomCircle.fillCircle(0, 0, size + 5);
+            
+            if (cell.energy > 3) {
+              atomCircle.fillStyle(color, 0.1);
+              atomCircle.fillCircle(0, 0, size + 10);
+            }
+          }
+          
+          // Create energy text
+          const energyText = scene.add.text(0, 0, cell.energy.toString(), {
+            fontSize: '14px',
+            color: '#FFFFFF',
+            fontStyle: 'bold'
+          }).setOrigin(0.5);
+          
+          // Add to container
+          atomContainer.add(atomCircle);
+          atomContainer.add(energyText);
+          
+          // Add physics body
+          const physicsCircle = scene.matter.add.circle(canvasPos.x, canvasPos.y, size, {
+            restitution: 0.9,
+            friction: 0.005,
+            frictionAir: 0.001,
+          });
+          
+          scene.matter.add.gameObject(atomContainer, physicsCircle);
+          
+          // Set velocity with random direction but magnitude based on energy
+          const angle = Math.random() * Math.PI * 2;
+          const speed = 0.5 + cell.energy * 0.1;
+          scene.matter.body.setVelocity(physicsCircle, {
+            x: Math.cos(angle) * speed,
+            y: Math.sin(angle) * speed
+          });
+          
+          // Make high energy atoms pulse
+          if (cell.energy >= 2) {
+            scene.tweens.add({
+              targets: atomContainer,
+              scaleX: 1.2,
+              scaleY: 1.2,
+              duration: 300,
+              yoyo: true,
+              repeat: -1,
+              ease: 'Sine.easeInOut'
+            });
+          }
+          
+          // Store reference to the atom
+          atomsRef.current.set(atomKey, atomContainer);
+        }
+      });
+      
+      // Remove atoms that are no longer in the cells array
+      atomsRef.current.forEach((atom, key) => {
+        if (!currentAtomKeys.has(key)) {
+          // Make it fade out
+          scene.tweens.add({
+            targets: atom,
+            alpha: 0,
+            scale: 0.5,
+            duration: 300,
+            onComplete: () => {
+              // Remove the physics body
+              if (atom.body) {
+                scene.matter.world.remove(atom.body);
+              }
+              // Remove from scene
+              atom.destroy();
+              // Remove from our reference map
+              atomsRef.current.delete(key);
+            }
+          });
+        }
+      });
+      
+      // Draw connections between high energy atoms
+      scene.matter.world.renderBodyBounds = false;
+      scene.matter.world.renderVelocity = false;
+      
+      // Create a new graphics object for connections
+      const graphics = scene.add.graphics();
+      graphics.clear();
+      
+      const highEnergyCells = cells.filter(cell => cell.energy > 3);
+      
+      for (let i = 0; i < highEnergyCells.length; i++) {
+        for (let j = i + 1; j < highEnergyCells.length; j++) {
+          const cell1 = highEnergyCells[i];
+          const cell2 = highEnergyCells[j];
+          
+          // Only connect nearby cells
+          const dx = cell1.x - cell2.x;
+          const dy = cell1.y - cell2.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          
+          if (distance < 8) {
+            const atom1 = atomsRef.current.get(`${cell1.x}-${cell1.y}`);
+            const atom2 = atomsRef.current.get(`${cell2.x}-${cell2.y}`);
+            
+            if (atom1 && atom2) {
+              const lineWidth = Math.min((cell1.energy + cell2.energy) / 30, 2);
+              
+              // Interpolate color between the two atoms
+              const color1 = getEnergyColor(cell1.energy);
+              const color2 = getEnergyColor(cell2.energy);
+              
+              graphics.lineStyle(lineWidth, color1, 0.4);
+              graphics.beginPath();
+              graphics.moveTo(atom1.x, atom1.y);
+              graphics.lineTo(atom2.x, atom2.y);
+              graphics.strokePath();
+            }
+          }
+        }
+      }
+    };
+    
+    // Run the update
+    updateAtoms();
+    
+    // Set up a timer to periodically update the atom positions
+    const timer = setInterval(() => {
+      updateAtoms();
+    }, 50);
     
     return () => {
-      window.cancelAnimationFrame(animationFrameId);
+      clearInterval(timer);
     };
-  }, [cells]);
-  
-  // Set canvas size on resize
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    
-    canvas.width = gridSize * cellSize;
-    canvas.height = gridSize * cellSize;
-    
-    draw();
-  }, [gridSize, cellSize]);
+  }, [cells, gridSize, maxEnergy, canvasSize, isClient]);
   
   return (
     <Card className="h-full">
@@ -312,18 +412,19 @@ const ReactionBoard: React.FC<ReactionBoardProps> = ({
         <CardTitle>Chain Reaction Simulation</CardTitle>
       </CardHeader>
       <CardContent className="flex justify-center">
-        <canvas
-          ref={canvasRef}
-          onClick={handleCanvasClick}
-          className="border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 cursor-pointer"
+        <div 
+          ref={canvasContainerRef} 
+          className="w-full flex justify-center"
           style={{
-            width: `${gridSize * cellSize}px`,
-            height: `${gridSize * cellSize}px`,
+            aspectRatio: `${gridSize}/${gridSize}`,
+            maxWidth: `${gridSize * cellSize}px`,
+            background: 'linear-gradient(to bottom, #111827, #1f2937)',
+            borderRadius: '0.5rem'
           }}
         />
       </CardContent>
       <div className="px-6 pb-4 text-center text-sm text-muted-foreground">
-        Click on cells to add energy. Cells with energy `&gt;` 1 will explode!
+        Click anywhere to add energy. Atoms with energy &gt; 1 will explode!
       </div>
     </Card>
   );
