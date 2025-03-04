@@ -7,10 +7,15 @@ const supabaseUrl = process.env.SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// Transaction types - defined as constants but NOT exported
+const TX_TYPE_REACTION = 'reaction';
+const TX_TYPE_EXPLOSION = 'explosion';
+
 export interface Cell {
   x: number;
   y: number;
   energy: number;
+  type?: string; // Optional type field
 }
 
 export interface TransactionQueueItem {
@@ -22,6 +27,7 @@ export interface TransactionQueueItem {
   hash?: string;
   timestamp: number;
   retries: number;
+  type?: string; // Add transaction type
 }
 
 /**
@@ -65,18 +71,25 @@ export async function getCells(): Promise<{ cells: Cell[]; error?: string }> {
 
 /**
  * Add a transaction to the queue
+ * Now accepts transaction type
  */
-export async function addToTransactionQueue(cell: Cell): Promise<{ success: boolean; error?: string }> {
+export async function addToTransactionQueue(
+  cellData: Cell & { type?: string }
+): Promise<{ success: boolean; error?: string }> {
   try {
+    // Set default type if not provided
+    const type = cellData.type || TX_TYPE_REACTION;
+    
     const { error } = await supabase
       .from('transaction_queue')
       .insert({
-        x: cell.x,
-        y: cell.y,
-        energy: cell.energy,
+        x: cellData.x,
+        y: cellData.y,
+        energy: cellData.energy,
         status: 'pending',
         timestamp: Date.now(),
-        retries: 0
+        retries: 0,
+        type: type // Add type field
       });
 
     if (error) throw error;
@@ -199,4 +212,63 @@ export async function getPendingTransactionCount(): Promise<{ count: number; err
     console.error('Server Action Error - getPendingTransactionCount:', error);
     return { count: 0, error: error.message };
   }
+}
+
+/**
+ * Get explosion count
+ */
+export async function getExplosionCount(): Promise<{ count: number; error?: string }> {
+  try {
+    const { data, error, count } = await supabase
+      .from('transaction_queue')
+      .select('*', { count: 'exact', head: true })
+      .eq('type', TX_TYPE_EXPLOSION)
+      .eq('status', 'sent');
+
+    if (error) throw error;
+    return { count: count || 0 };
+  } catch (error: any) {
+    console.error('Server Action Error - getExplosionCount:', error);
+    return { count: 0, error: error.message };
+  }
+}
+
+/**
+ * Add an explosion to the transaction queue
+ * Convenience function for adding explosion records
+ */
+export async function addExplosionToQueue(): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { error } = await supabase
+      .from('transaction_queue')
+      .insert({
+        x: 0, // Not used for explosions
+        y: 0, // Not used for explosions
+        energy: 0, // Not used for explosions
+        status: 'pending',
+        timestamp: Date.now(),
+        retries: 0,
+        type: TX_TYPE_EXPLOSION
+      });
+
+    if (error) throw error;
+    return { success: true };
+  } catch (error: any) {
+    console.error('Server Action Error - addExplosionToQueue:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Get transaction type constants
+ * Helper function to get the transaction types since we can't export constants
+ */
+export async function getTransactionTypes(): Promise<{ 
+  REACTION: string; 
+  EXPLOSION: string 
+}> {
+  return {
+    REACTION: TX_TYPE_REACTION,
+    EXPLOSION: TX_TYPE_EXPLOSION
+  };
 }
