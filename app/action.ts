@@ -7,19 +7,39 @@ const supabaseUrl = process.env.SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+/**
+ * Check if Supabase connection is working
+ */
+export async function checkSupabaseConnection(): Promise<{ success: boolean; error?: string }> {
+  try {
+    // Try a simple query to check if the connection works
+    const { data, error } = await supabase
+      .from('transaction_queue')
+      .select('count(*)', { count: 'exact', head: true });
+
+    if (error) throw error;
+    return { success: true };
+  } catch (error: any) {
+    console.error('Server Action Error - checkSupabaseConnection:', error);
+    return { success: false, error: error.message };
+  }
+}
+
 // Transaction types - defined as constants but NOT exported
 const TX_TYPE_REACTION = 'reaction';
 const TX_TYPE_EXPLOSION = 'explosion';
 
 export interface Cell {
+  id: string;     // Added ID field
   x: number;
   y: number;
   energy: number;
-  type?: string; // Optional type field
+  type?: string;  // Optional type field
 }
 
 export interface TransactionQueueItem {
-  id?: number;
+  id?: number;    // Database ID for the queue item
+  atom_id?: string; // Reference to the atom's ID
   x: number;
   y: number;
   energy: number;
@@ -27,21 +47,29 @@ export interface TransactionQueueItem {
   hash?: string;
   timestamp: number;
   retries: number;
-  type?: string; // Add transaction type
+  type?: string;  // Add transaction type
 }
 
 /**
- * Add or update a cell in the database
+ * Add or update a cell in the database using ID as primary key
  */
 export async function addCell(cell: Cell): Promise<{ success: boolean; error?: string }> {
   try {
+    // Ensure the cell has an ID
+    if (!cell.id) {
+      throw new Error('Cell must have an ID');
+    }
+
     const { error } = await supabase
       .from('cells')
       .upsert({
+        id: cell.id,     // Use ID as primary key
         x: cell.x,
         y: cell.y,
         energy: cell.energy,
         timestamp: Date.now()
+      }, {
+        onConflict: 'id' // Specify conflict resolution on ID
       });
 
     if (error) throw error;
@@ -53,25 +81,31 @@ export async function addCell(cell: Cell): Promise<{ success: boolean; error?: s
 }
 
 /**
- * Get all cells from the database
+ * Get all cells from the database without filtering by type
  */
 export async function getCells(): Promise<{ cells: Cell[]; error?: string }> {
-  try {
-    const { data, error } = await supabase
-      .from('cells')
-      .select('*');
-
-    if (error) throw error;
-    return { cells: data || [] };
-  } catch (error: any) {
-    console.error('Server Action Error - getCells:', error);
-    return { cells: [], error: error.message };
+    try {
+      console.log('Fetching cells from database...');
+      
+      // Get all cells without filtering by type since the column doesn't exist
+      const { data, error } = await supabase
+        .from('cells')
+        .select('*')
+        .order('timestamp', { ascending: false });
+  
+      if (error) throw error;
+      
+      console.log(`Found ${data?.length || 0} cells in database`);
+      return { cells: data || [] };
+    } catch (error: any) {
+      console.error('Server Action Error - getCells:', error);
+      return { cells: [], error: error.message };
+    }
   }
-}
 
 /**
  * Add a transaction to the queue
- * Now accepts transaction type
+ * Now accepts atom ID
  */
 export async function addToTransactionQueue(
   cellData: Cell & { type?: string }
@@ -83,13 +117,14 @@ export async function addToTransactionQueue(
     const { error } = await supabase
       .from('transaction_queue')
       .insert({
+        atom_id: cellData.id, // Store atom ID in transaction
         x: cellData.x,
         y: cellData.y,
         energy: cellData.energy,
         status: 'pending',
         timestamp: Date.now(),
         retries: 0,
-        type: type // Add type field
+        type: type        // Add type field
       });
 
     if (error) throw error;
@@ -104,25 +139,33 @@ export async function addToTransactionQueue(
  * Get the next pending transaction from the queue
  */
 export async function getNextPendingTransaction(): Promise<{ transaction: TransactionQueueItem | null; error?: string }> {
-  try {
-    const { data, error } = await supabase
-      .from('transaction_queue')
-      .select('*')
-      .eq('status', 'pending')
-      .order('timestamp', { ascending: true })
-      .limit(1)
-      .single();
-
-    if (error && error.code !== 'PGRST116') throw error; // PGRST116 is "no rows returned"
-    return { transaction: data || null };
-  } catch (error: any) {
-    if (error.code === 'PGRST116') {
-      return { transaction: null }; // No pending transactions
+    console.log('getNextPendingTransaction called');
+    try {
+      console.log('Querying transaction_queue table');
+      const { data, error } = await supabase
+        .from('transaction_queue')
+        .select('*')
+        .eq('status', 'pending')
+        .order('timestamp', { ascending: true })
+        .limit(1)
+        .single();
+  
+      if (error && error.code !== 'PGRST116') {
+        console.error('Supabase query error:', error);
+        throw error;
+      }
+      
+      console.log('Query successful, returning data:', data ? 'Some data' : 'No data');
+      return { transaction: data || null };
+    } catch (error: any) {
+      if (error.code === 'PGRST116') {
+        console.log('No pending transactions found');
+        return { transaction: null }; // No pending transactions
+      }
+      console.error('Server Action Error - getNextPendingTransaction:', error);
+      return { transaction: null, error: error.message };
     }
-    console.error('Server Action Error - getNextPendingTransaction:', error);
-    return { transaction: null, error: error.message };
   }
-}
 
 /**
  * Update a transaction status
@@ -186,7 +229,7 @@ export async function clearAllCells(): Promise<{ success: boolean; error?: strin
     const { error } = await supabase
       .from('cells')
       .delete()
-      .neq('x', null);
+      .neq('id', null);  // Changed from x to id
 
     if (error) throw error;
     return { success: true };
@@ -255,6 +298,47 @@ export async function addExplosionToQueue(): Promise<{ success: boolean; error?:
     return { success: true };
   } catch (error: any) {
     console.error('Server Action Error - addExplosionToQueue:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Get recent transactions
+ */
+export async function getRecentTransactions(): Promise<{ 
+    transactions: TransactionQueueItem[]; 
+    error?: string 
+  }> {
+    try {
+      const { data, error } = await supabase
+        .from('transaction_queue')
+        .select('*')
+        .eq('status', 'sent')
+        .order('timestamp', { ascending: false })
+        .limit(50);
+  
+      if (error) throw error;
+      return { transactions: data || [] };
+    } catch (error: any) {
+      console.error('Server Action Error - getRecentTransactions:', error);
+      return { transactions: [], error: error.message };
+    }
+  }
+
+/**
+ * Delete a cell from the database
+ */
+export async function deleteCell(id: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { error } = await supabase
+      .from('cells')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    return { success: true };
+  } catch (error: any) {
+    console.error('Server Action Error - deleteCell:', error);
     return { success: false, error: error.message };
   }
 }

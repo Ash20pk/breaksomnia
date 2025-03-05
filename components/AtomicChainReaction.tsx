@@ -10,8 +10,11 @@ import {
   getPendingTransactionCount,
   getNextPendingTransaction,
   updateTransactionStatus,
-  getTransactionTypes
+  getTransactionTypes,
+  getCells
 } from '@/app/action';
+import { TransactionProcessor } from '@/utils/TransactionProcessor';
+
 
 // Components
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -40,49 +43,102 @@ const ATOM_RADIUS = 15;
 const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '';
 
 // ABI for our contract
+// Updated ABI for the new ChainReactionRecorder contract
 const ABI = [
-  {
-    name: 'recordReaction',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: '_x', type: 'uint256' },
-      { name: '_y', type: 'uint256' },
-      { name: '_energy', type: 'uint256' }
-    ],
-    outputs: []
-  },
-  {
-    name: 'recordExplosion',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [],
-    outputs: []
-  }
-];
+    {
+      name: 'recordReaction',
+      type: 'function',
+      stateMutability: 'nonpayable',
+      inputs: [
+        { name: '_x', type: 'uint256' },
+        { name: '_y', type: 'uint256' },
+        { name: '_energy', type: 'uint256' },
+        { name: '_atomId', type: 'string' }
+      ],
+      outputs: []
+    },
+    {
+      name: 'recordExplosion',
+      type: 'function',
+      stateMutability: 'nonpayable',
+      inputs: [
+        { name: '_atomId', type: 'string' }
+      ],
+      outputs: []
+    },
+    {
+      name: 'getStats',
+      type: 'function',
+      stateMutability: 'view',
+      inputs: [],
+      outputs: [
+        { name: '', type: 'uint256' }, // totalReactions
+        { name: '', type: 'uint256' }, // totalExplosions
+        { name: '', type: 'uint256' }  // lastTimestamp
+      ]
+    },
+    {
+      name: 'totalReactions',
+      type: 'function',
+      stateMutability: 'view',
+      inputs: [],
+      outputs: [{ name: '', type: 'uint256' }]
+    },
+    {
+      name: 'totalExplosions',
+      type: 'function',
+      stateMutability: 'view',
+      inputs: [],
+      outputs: [{ name: '', type: 'uint256' }]
+    },
+    {
+      name: 'lastTimestamp',
+      type: 'function',
+      stateMutability: 'view',
+      inputs: [],
+      outputs: [{ name: '', type: 'uint256' }]
+    },
+    {
+      name: 'CellReaction',
+      type: 'event',
+      inputs: [
+        { name: 'x', type: 'uint256', indexed: false },
+        { name: 'y', type: 'uint256', indexed: false },
+        { name: 'energy', type: 'uint256', indexed: false },
+        { name: 'atomId', type: 'string', indexed: false }
+      ]
+    },
+    {
+      name: 'Explosion',
+      type: 'event',
+      inputs: [
+        { name: 'atomId', type: 'string', indexed: false }
+      ]
+    }
+  ];
 
 // Atom interface
 interface Atom {
-  id: string;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  energy: number;
-  radius: number;
-  color: string;
-  lastCollision: number;
+    id: string;       // ID is required and used as the primary key
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    energy: number;
+    radius: number;
+    color: string;
+    lastCollision: number;
 }
 
 // Transaction interface
 interface Transaction {
-  hash: string;
-  atomId?: string;
-  x: number;
-  y: number;
-  energy: number;
-  timestamp: number;
-  type: string;
+    hash: string;
+    atom_id?: string; // Add atom_id to track which atom this transaction belongs to
+    x: number;
+    y: number;
+    energy: number;
+    timestamp: number;
+    type: string;
 }
 
 const AtomicChainReaction: React.FC = () => {
@@ -177,16 +233,79 @@ const AtomicChainReaction: React.FC = () => {
     initBlockchain();
   }, []);
 
-  // Process transaction queue
-  useEffect(() => {
-    let isMounted = true;
-    
-    const processTxQueue = async () => {
-      if (processingTxRef.current || isLoadingRef.current || isPaused || !walletClient || !publicClient || !CONTRACT_ADDRESS) {
+  // Function to load active atoms from the database
+const loadAtomsFromDatabase = async () => {
+    try {
+      // Fetch all active cells from the database
+      const { cells, error } = await getCells();
+      
+      if (error) {
+        console.error('Error loading atoms from database:', error);
+        toast.error('Failed to load saved atoms');
         return;
       }
       
-      processingTxRef.current = true;
+      // Filter to only get active (non-exploded) atoms
+      const activeAtoms = cells.filter(cell => cell.type !== 'exploded');
+      
+      if (activeAtoms.length === 0) {
+        console.log('No active atoms found in database');
+        return;
+      }
+      
+      console.log(`Found ${activeAtoms.length} active atoms in database`);
+      
+      // Convert database cells to Atom objects
+      const loadedAtoms: Atom[] = activeAtoms.map(cell => {
+        // Generate random velocity for the atom
+        const speed = Math.random() * 1 + 0.5;
+        const angle = Math.random() * Math.PI * 2;
+        
+        return {
+          id: cell.id,
+          x: cell.x,
+          y: cell.y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          energy: cell.energy,
+          radius: ATOM_RADIUS,
+          color: getAtomColor(cell.energy),
+          lastCollision: 0
+        };
+      });
+      
+      // Deduplicate atoms in case there are any with the same ID
+      const uniqueAtoms = deduplicateAtoms(loadedAtoms);
+      
+      // Update the atoms state with loaded atoms
+      setAtoms(uniqueAtoms);
+      toast.success(`Loaded ${uniqueAtoms.length} atoms from database`);
+    } catch (error) {
+      console.error('Failed to load atoms:', error);
+      toast.error('Failed to load saved atoms');
+    }
+  };
+
+  // Load atoms from database when component mounts
+useEffect(() => {
+    // Only load atoms if there are none already in the state
+    // This prevents reloading atoms when the component re-renders
+    if (atoms.length === 0) {
+      loadAtomsFromDatabase();
+    }
+  }, []);
+
+  // Initialize transaction processor
+  useEffect(() => {
+    if (isPaused || !walletClient || !publicClient || !CONTRACT_ADDRESS) return;
+    
+    let isMounted = true;
+    const processingRef = { current: false };
+    
+    const processTxQueue = async () => {
+      if (processingRef.current || !isMounted) return;
+      
+      processingRef.current = true;
       
       try {
         const result = await getNextPendingTransaction();
@@ -195,25 +314,24 @@ const AtomicChainReaction: React.FC = () => {
         
         if (result.error) {
           console.error('Error getting next pending transaction:', result.error);
-          processingTxRef.current = false;
+          processingRef.current = false;
           return;
         }
         
         const nextTx = result.transaction;
         
         if (nextTx && nextTx.id) {
-          isLoadingRef.current = true;
-          
           try {
             let hash;
             
             if (nextTx.type === txTypes.EXPLOSION) {
-              // Process explosion transaction
+              // Process explosion transaction with atom ID
+              const atomId = nextTx.atom_id || '';
               const { request } = await publicClient.simulateContract({
                 address: CONTRACT_ADDRESS as `0x${string}`,
                 abi: ABI,
                 functionName: 'recordExplosion',
-                args: [],
+                args: [atomId],
                 account: walletClient.account
               });
               
@@ -224,12 +342,13 @@ const AtomicChainReaction: React.FC = () => {
               
               setExplosionCount(prev => prev + 1);
             } else {
-              // Process regular reaction transaction
+              // Process regular reaction transaction with atom ID
+              const atomId = nextTx.atom_id || '';
               const { request } = await publicClient.simulateContract({
                 address: CONTRACT_ADDRESS as `0x${string}`,
                 abi: ABI,
                 functionName: 'recordReaction',
-                args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy)],
+                args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
                 account: walletClient.account
               });
               
@@ -249,6 +368,7 @@ const AtomicChainReaction: React.FC = () => {
               setTransactions(prev => {
                 const newTransaction: Transaction = {
                   hash,
+                  atom_id: nextTx.atom_id,
                   x: nextTx.x,
                   y: nextTx.y,
                   energy: nextTx.energy,
@@ -265,16 +385,12 @@ const AtomicChainReaction: React.FC = () => {
             console.error('Transaction error:', err);
             // Mark transaction as failed
             await updateTransactionStatus(nextTx.id, 'failed');
-          } finally {
-            if (isMounted) {
-              isLoadingRef.current = false;
-            }
           }
         }
       } catch (error) {
         console.error('Error processing transaction queue:', error);
       } finally {
-        processingTxRef.current = false;
+        processingRef.current = false;
       }
     };
     
@@ -299,7 +415,27 @@ const AtomicChainReaction: React.FC = () => {
       clearInterval(interval);
       clearInterval(pendingInterval);
     };
-  }, [walletClient, publicClient, isPaused, txTypes]);
+  }, [walletClient, publicClient, isPaused, txTypes, CONTRACT_ADDRESS, ABI]);
+
+    useEffect(() => {
+        if (isPaused || atoms.length === 0) return;
+        
+        // Update database every 5 seconds instead of every frame
+        // This reduces database load while still keeping positions relatively updated
+        const updateInterval = setInterval(() => {
+          // Choose a subset of atoms to update each interval to spread the load
+          // For example, update 20% of atoms each time
+          const updateCount = Math.max(1, Math.ceil(atoms.length * 0.2));
+          const atomsToUpdate = atoms.slice(0, updateCount);
+          
+          // Update positions in database
+          atomsToUpdate.forEach(atom => {
+            storeCellInDatabase(atom);
+          });
+        }, 5000);
+        
+        return () => clearInterval(updateInterval);
+      }, [isPaused, atoms]);
 
   // Animation loop
   useEffect(() => {
@@ -341,6 +477,48 @@ const AtomicChainReaction: React.FC = () => {
       cancelAnimationFrame(animationRef.current);
     };
   }, [isPaused, atoms]);
+
+  // Function to prevent duplicate atoms with the same ID
+const deduplicateAtoms = (atoms: Atom[]): Atom[] => {
+    // Create a Map using atom IDs as keys to ensure uniqueness
+    const atomMap = new Map<string, Atom>();
+    
+    // Add each atom to the map, newer ones overwrite older ones with the same ID
+    atoms.forEach(atom => {
+      atomMap.set(atom.id, atom);
+    });
+    
+    // Convert the Map values back to an array
+    return Array.from(atomMap.values());
+  };
+
+  // Function to store cell data in the database
+const storeCellInDatabase = async (atom: Atom) => {
+    try {
+      await addCell({
+        id: atom.id,
+        x: Math.floor(atom.x),
+        y: Math.floor(atom.y),
+        energy: atom.energy,
+        type: 'active'
+      });
+    } catch (error) {
+      console.error('Error storing cell in database:', error);
+    }
+  };
+  
+  // Update function for when an atom's energy changes (e.g., during collision)
+  const updateAtomEnergy = async (atom: Atom, newEnergy: number) => {
+    // Update local state
+    atom.energy = newEnergy;
+    atom.color = getAtomColor(newEnergy);
+    
+    // Update in database
+    await storeCellInDatabase(atom);
+    
+    // Queue transaction
+    await queueAtomTransaction(atom);
+  };
 
   // Draw laboratory background
   const drawLaboratory = (ctx: CanvasRenderingContext2D) => {
@@ -410,102 +588,108 @@ const AtomicChainReaction: React.FC = () => {
     }
     
     // Second pass: Atom-to-atom collisions
-    for (let i = 0; i < updatedAtoms.length; i++) {
-      for (let j = i + 1; j < updatedAtoms.length; j++) {
-        const atomA = updatedAtoms[i];
-        const atomB = updatedAtoms[j];
+    // Second pass: Atom-to-atom collisions
+for (let i = 0; i < updatedAtoms.length; i++) {
+    for (let j = i + 1; j < updatedAtoms.length; j++) {
+      const atomA = updatedAtoms[i];
+      const atomB = updatedAtoms[j];
+      
+      // Skip if either atom has already been processed for explosion
+      if (atomA.energy >= MAX_ENERGY || atomB.energy >= MAX_ENERGY) continue;
+      
+      // Calculate distance between atoms
+      const dx = atomB.x - atomA.x;
+      const dy = atomB.y - atomA.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      
+      // Check for collision
+      if (distance < atomA.radius + atomB.radius) {
+        // Create a unique collision ID
+        const collisionId = [atomA.id, atomB.id].sort().join('_');
         
-        // Skip if either atom has already been processed for explosion
-        if (atomA.energy >= MAX_ENERGY || atomB.energy >= MAX_ENERGY) continue;
-        
-        // Calculate distance between atoms
-        const dx = atomB.x - atomA.x;
-        const dy = atomB.y - atomA.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        
-        // Check for collision
-        if (distance < atomA.radius + atomB.radius) {
-          // Create a unique collision ID
-          const collisionId = [atomA.id, atomB.id].sort().join('_');
+        // Check if this collision was already processed recently
+        const now = Date.now();
+        if (now - atomA.lastCollision > 500 && now - atomB.lastCollision > 500 && !collisionsProcessed.has(collisionId)) {
+          collisionsProcessed.add(collisionId);
           
-          // Check if this collision was already processed recently
-          const now = Date.now();
-          if (now - atomA.lastCollision > 500 && now - atomB.lastCollision > 500 && !collisionsProcessed.has(collisionId)) {
-            collisionsProcessed.add(collisionId);
-            
-            // Collision response - physics
-            const nx = dx / distance;
-            const ny = dy / distance;
-            
-            // Relative velocity
-            const vx = atomB.vx - atomA.vx;
-            const vy = atomB.vy - atomA.vy;
-            
-            // Relative velocity along normal
-            const velAlongNormal = vx * nx + vy * ny;
-            
-            // Skip if atoms are moving away from each other
-            if (velAlongNormal > 0) continue;
-            
-            // Bounce effect - simplified physics
-            const bounceFactor = 1.5; // More energetic bounce
-            
-            // New velocities
-            const dv = velAlongNormal * bounceFactor;
-            
-            atomA.vx -= nx * dv;
-            atomA.vy -= ny * dv;
-            atomB.vx += nx * dv;
-            atomB.vy += ny * dv;
-            
-            // Move atoms apart to prevent sticking
-            const overlap = (atomA.radius + atomB.radius - distance) * 0.5;
-            atomA.x -= nx * overlap;
-            atomA.y -= ny * overlap;
-            atomB.x += nx * overlap;
-            atomB.y += ny * overlap;
-            
-            // Increase energy for both atoms
-            atomA.energy += 1;
-            atomB.energy += 1;
-            
-            // Update last collision time
-            atomA.lastCollision = now;
-            atomB.lastCollision = now;
-            
-            // Update energy colors
-            atomA.color = getAtomColor(atomA.energy);
-            atomB.color = getAtomColor(atomB.energy);
-            
-            // Queue transactions
-            queueAtomTransaction(atomA);
-            queueAtomTransaction(atomB);
-            
-            // Play collision sound
-            playSound('collision');
-          }
+          // Collision response - physics
+          const nx = dx / distance;
+          const ny = dy / distance;
+          
+          // Relative velocity
+          const vx = atomB.vx - atomA.vx;
+          const vy = atomB.vy - atomA.vy;
+          
+          // Relative velocity along normal
+          const velAlongNormal = vx * nx + vy * ny;
+          
+          // Skip if atoms are moving away from each other
+          if (velAlongNormal > 0) continue;
+          
+          // Bounce effect - simplified physics
+          const bounceFactor = 1.5; // More energetic bounce
+          
+          // New velocities
+          const dv = velAlongNormal * bounceFactor;
+          
+          atomA.vx -= nx * dv;
+          atomA.vy -= ny * dv;
+          atomB.vx += nx * dv;
+          atomB.vy += ny * dv;
+          
+          // Move atoms apart to prevent sticking
+          const overlap = (atomA.radius + atomB.radius - distance) * 0.5;
+          atomA.x -= nx * overlap;
+          atomA.y -= ny * overlap;
+          atomB.x += nx * overlap;
+          atomB.y += ny * overlap;
+          
+          // Increase energy for both atoms
+          atomA.energy += 1;
+          atomB.energy += 1;
+          
+          // Update last collision time
+          atomA.lastCollision = now;
+          atomB.lastCollision = now;
+          
+          // Update energy colors
+          atomA.color = getAtomColor(atomA.energy);
+          atomB.color = getAtomColor(atomB.energy);
+          
+          // Update atoms in database and queue transactions
+          storeCellInDatabase(atomA);
+          storeCellInDatabase(atomB);
+          queueAtomTransaction(atomA);
+          queueAtomTransaction(atomB);
+          
+          // Play collision sound
+          playSound('collision');
         }
       }
     }
+  }
     
     // Check for explosions
     for (let i = updatedAtoms.length - 1; i >= 0; i--) {
-      const atom = updatedAtoms[i];
-      
-      if (atom.energy >= MAX_ENERGY) {
-        // Trigger explosion
-        createExplosion(atom.x, atom.y);
+        const atom = updatedAtoms[i];
         
-        // Queue explosion transaction
-        queueExplosion(atom);
-        
-        // Remove the exploded atom
-        updatedAtoms.splice(i, 1);
-        
-        // Play explosion sound
-        playSound('explosion');
+        if (atom.energy >= MAX_ENERGY) {
+          // Queue explosion transaction with atom ID before removing it
+          queueExplosion(atom);
+          
+          // Create explosion effect and new fragments
+          createExplosion(atom.x, atom.y, atom.id);
+          
+          // Remove the exploded atom
+          updatedAtoms.splice(i, 1);
+          
+          // Play explosion sound
+          playSound('explosion');
+          
+          // Update explosion count
+          setExplosionCount(prev => prev + 1);
+        }
       }
-    }
     
     // Draw atoms
     updatedAtoms.forEach(atom => {
@@ -565,7 +749,7 @@ const AtomicChainReaction: React.FC = () => {
   };
 
   // Create explosion effect
-  const createExplosion = (x: number, y: number) => {
+  const createExplosion = (x: number, y: number, parentId: string) => {
     // Create smaller atoms from explosion
     const fragmentCount = Math.floor(Math.random() * 2) + 3; // 3-4 fragments
     
@@ -574,9 +758,12 @@ const AtomicChainReaction: React.FC = () => {
     for (let i = 0; i < fragmentCount; i++) {
       const angle = (Math.PI * 2 / fragmentCount) * i;
       
+      // Create a unique ID for each fragment that references the parent atom
+      const fragmentId = `fragment-${parentId}-${i}-${Date.now()}`;
+      
       // Create new atom with random properties
       const newAtom: Atom = {
-        id: `atom-${Date.now()}-${i}`,
+        id: fragmentId,
         x: x,
         y: y,
         vx: Math.cos(angle) * (Math.random() * 3 + 2),
@@ -586,6 +773,12 @@ const AtomicChainReaction: React.FC = () => {
         color: getAtomColor(1),
         lastCollision: 0
       };
+      
+      // Store the new fragment in the database
+      storeCellInDatabase(newAtom);
+      
+      // Queue transaction for the new fragment
+      queueAtomTransaction(newAtom);
       
       newAtoms.push(newAtom);
     }
@@ -616,8 +809,11 @@ const AtomicChainReaction: React.FC = () => {
     const speed = Math.random() * 1 + 0.5;
     const angle = Math.random() * Math.PI * 2;
     
+    // Generate a unique ID for the atom
+    const atomId = `atom-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    
     const newAtom: Atom = {
-      id: `atom-${Date.now()}`,
+      id: atomId,
       x: x,
       y: y,
       vx: Math.cos(angle) * speed,
@@ -630,6 +826,9 @@ const AtomicChainReaction: React.FC = () => {
     
     // Add to state
     setAtoms(prev => [...prev, newAtom]);
+    
+    // Store in database
+    storeCellInDatabase(newAtom);
     
     // Queue transaction
     queueAtomTransaction(newAtom);
@@ -648,12 +847,17 @@ const AtomicChainReaction: React.FC = () => {
   // Queue atom transaction
   const queueAtomTransaction = async (atom: Atom) => {
     try {
+      // Queue the transaction
       await addToTransactionQueue({
+        id: atom.id,
         x: Math.floor(atom.x),
         y: Math.floor(atom.y),
         energy: atom.energy,
         type: txTypes.REACTION
       });
+      
+      // Also update the cell in the database
+      await storeCellInDatabase(atom);
     } catch (error) {
       console.error('Error queuing atom transaction:', error);
     }
@@ -663,11 +867,23 @@ const AtomicChainReaction: React.FC = () => {
   const queueExplosion = async (atom: Atom) => {
     try {
       await addToTransactionQueue({
+        id: atom.id,       // Include the atom ID
         x: Math.floor(atom.x),
         y: Math.floor(atom.y),
         energy: atom.energy,
         type: txTypes.EXPLOSION
       });
+      
+      // For analytics, you might want to store the exploded atom data
+      // This is optional but can be useful for tracking which atoms exploded
+      await addCell({
+        id: atom.id,
+        x: Math.floor(atom.x),
+        y: Math.floor(atom.y),
+        energy: MAX_ENERGY,
+        type: 'exploded'  // Mark this atom as exploded in the database
+      });
+      
     } catch (error) {
       console.error('Error queuing explosion transaction:', error);
     }
