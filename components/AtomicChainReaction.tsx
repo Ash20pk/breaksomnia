@@ -11,7 +11,9 @@ import {
   getNextPendingTransaction,
   updateTransactionStatus,
   getTransactionTypes,
-  getCells
+  getCells,
+  getRecentTransactions,
+  deleteCell
 } from '@/app/action';
 import { TransactionProcessor } from '@/utils/TransactionProcessor';
 
@@ -128,6 +130,7 @@ interface Atom {
     radius: number;
     color: string;
     lastCollision: number;
+    isFragment: boolean; // Add this property to track if it's a fragment
 }
 
 // Transaction interface
@@ -233,10 +236,54 @@ const AtomicChainReaction: React.FC = () => {
     initBlockchain();
   }, []);
 
-  // Function to load active atoms from the database
-const loadAtomsFromDatabase = async () => {
+  // Function to load recent transactions into the UI
+const loadRecentTransactions = async () => {
     try {
-      // Fetch all active cells from the database
+      console.log('Loading recent transactions...');
+      
+      // Fetch recent transactions from the database
+      const { transactions, error } = await getRecentTransactions();
+      
+      if (error) {
+        console.error('Error loading transactions:', error);
+        toast.error('Failed to load transaction history');
+        return;
+      }
+      
+      console.log(`Found ${transactions.length} recent transactions`);
+      
+      // Update UI with the loaded transactions
+      if (transactions.length > 0) {
+        setTransactions(transactions.map(tx => ({
+          hash: tx.hash || 'unknown',
+          atom_id: tx.atom_id,
+          x: tx.x,
+          y: tx.y,
+          energy: tx.energy,
+          timestamp: tx.timestamp,
+          type: tx.type || txTypes.REACTION
+        })));
+        
+        // Update transaction counts
+        const explosionCount = transactions.filter(tx => tx.type === txTypes.EXPLOSION).length;
+        const reactionCount = transactions.filter(tx => tx.type === txTypes.REACTION).length;
+        
+        setExplosionCount(prev => prev + explosionCount);
+        setTxCount(prev => prev + reactionCount);
+        
+        console.log(`Loaded ${explosionCount} explosions and ${reactionCount} reactions`);
+      }
+      
+    } catch (error) {
+      console.error('Failed to load transactions:', error);
+      toast.error('Failed to load transaction history');
+    }
+  };
+
+  // Updated function to load atoms and transactions
+  const loadAtomsFromDatabase = async () => {
+    try {
+      // Fetch all cells from the database
       const { cells, error } = await getCells();
       
       if (error) {
@@ -245,21 +292,44 @@ const loadAtomsFromDatabase = async () => {
         return;
       }
       
-      // Filter to only get active (non-exploded) atoms
-      const activeAtoms = cells.filter(cell => cell.type !== 'exploded');
+      console.log(`Found ${cells.length} cells in database`);
       
-      if (activeAtoms.length === 0) {
-        console.log('No active atoms found in database');
+      // Also load transactions
+      await loadRecentTransactions();
+      
+      // Also load pending transaction count
+      try {
+        const result = await getPendingTransactionCount();
+        setPendingTxCount(result.count);
+        console.log(`Found ${result.count} pending transactions`);
+      } catch (error) {
+        console.error('Error getting pending transaction count:', error);
+      }
+      
+      // If no cells found, create a default atom
+      if (cells.length === 0) {
+        console.log('No atoms found in database, creating a default atom');
+        
+        // Create a new atom
+        const centerX = CANVAS_WIDTH / 2;
+        const centerY = CANVAS_HEIGHT / 2;
+        
+        setTimeout(() => {
+          addAtom(centerX, centerY);
+          toast.info('Created a new atom to start');
+        }, 500);
+        
         return;
       }
       
-      console.log(`Found ${activeAtoms.length} active atoms in database`);
-      
       // Convert database cells to Atom objects
-      const loadedAtoms: Atom[] = activeAtoms.map(cell => {
+      const loadedAtoms: Atom[] = cells.map(cell => {
         // Generate random velocity for the atom
         const speed = Math.random() * 1 + 0.5;
         const angle = Math.random() * Math.PI * 2;
+        
+        // Check if this is a fragment based on the ID prefix
+        const isFragment = cell.id.startsWith('fragment-');
         
         return {
           id: cell.id,
@@ -268,9 +338,10 @@ const loadAtomsFromDatabase = async () => {
           vx: Math.cos(angle) * speed,
           vy: Math.sin(angle) * speed,
           energy: cell.energy,
-          radius: ATOM_RADIUS,
+          radius: isFragment ? ATOM_RADIUS * 0.8 : ATOM_RADIUS, // Adjust radius based on type
           color: getAtomColor(cell.energy),
-          lastCollision: 0
+          lastCollision: 0,
+          isFragment: isFragment // Set based on ID pattern
         };
       });
       
@@ -492,18 +563,27 @@ const deduplicateAtoms = (atoms: Atom[]): Atom[] => {
     return Array.from(atomMap.values());
   };
 
-  // Function to store cell data in the database
-const storeCellInDatabase = async (atom: Atom) => {
+  // Function to store cell data in the database with proper error handling
+  const storeCellInDatabase = async (atom: Atom) => {
     try {
-      await addCell({
+      // Ensure coordinates are integers and never null
+      const x = Math.floor(atom.x) || 0; // Default to 0 if null or NaN
+      const y = Math.floor(atom.y) || 0; // Default to 0 if null or NaN
+      
+      console.log(`Storing atom ${atom.id} at position (${x}, ${y}) with energy ${atom.energy}`);
+      
+      const result = await addCell({
         id: atom.id,
-        x: Math.floor(atom.x),
-        y: Math.floor(atom.y),
-        energy: atom.energy,
-        type: 'active'
+        x: x,
+        y: y,
+        energy: atom.energy || 0 // Default to 0 if null
       });
+      
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error storing cell');
+      }
     } catch (error) {
-      console.error('Error storing cell in database:', error);
+      console.error(`Error storing atom ${atom.id} in database:`, error);
     }
   };
   
@@ -560,7 +640,8 @@ const storeCellInDatabase = async (atom: Atom) => {
     
     const updatedAtoms = [...atoms];
     const collisionsProcessed = new Set<string>();
-    
+    let newFragments: Atom[] = []; // Array to collect all new fragments
+
     // First pass: Movement and wall collisions
     for (let i = 0; i < updatedAtoms.length; i++) {
       const atom = updatedAtoms[i];
@@ -669,38 +750,50 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     }
   }
     
-    // Check for explosions
+    // Check for explosions in updateAtoms function
     for (let i = updatedAtoms.length - 1; i >= 0; i--) {
-        const atom = updatedAtoms[i];
+    const atom = updatedAtoms[i];
+    
+    if (atom.energy >= MAX_ENERGY) {
+      // Queue explosion transaction with atom ID before removing it
+      queueExplosion(atom);
+      
+      // If it's a fragment, just remove it without creating new fragments
+      if (atom.isFragment) {
+        // Simply remove the fragment
+        updatedAtoms.splice(i, 1);
+      } else {
+        // For regular atoms, create explosion effect and collect new fragments
+        const fragments = createExplosion(atom.x, atom.y, atom.id);
+        newFragments = [...newFragments, ...fragments];
         
-        if (atom.energy >= MAX_ENERGY) {
-          // Queue explosion transaction with atom ID before removing it
-          queueExplosion(atom);
-          
-          // Create explosion effect and new fragments
-          createExplosion(atom.x, atom.y, atom.id);
-          
-          // Remove the exploded atom
-          updatedAtoms.splice(i, 1);
-          
-          // Play explosion sound
-          playSound('explosion');
-          
-          // Update explosion count
-          setExplosionCount(prev => prev + 1);
-        }
+        // Remove the exploded atom
+        updatedAtoms.splice(i, 1);
       }
-    
-    // Draw atoms
-    updatedAtoms.forEach(atom => {
-      drawAtom(ctx, atom);
-    });
-    
-    // Update atoms state if needed
-    if (JSON.stringify(atoms) !== JSON.stringify(updatedAtoms)) {
-      setAtoms(updatedAtoms);
+      
+      // Play explosion sound
+      playSound('explosion');
+      
+      // Update explosion count
+      setExplosionCount(prev => prev + 1);
     }
-  };
+  }
+  
+  // Draw atoms
+  updatedAtoms.forEach(atom => {
+    drawAtom(ctx, atom);
+  });
+  
+  // Draw new fragments
+  newFragments.forEach(atom => {
+    drawAtom(ctx, atom);
+  });
+  
+  // Update atoms state if needed, including both updated atoms and new fragments
+  if (JSON.stringify(atoms) !== JSON.stringify([...updatedAtoms, ...newFragments])) {
+    setAtoms([...updatedAtoms, ...newFragments]);
+  }
+};
 
   // Draw a single atom
   const drawAtom = (ctx: CanvasRenderingContext2D, atom: Atom) => {
@@ -748,11 +841,10 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     }
   };
 
-  // Create explosion effect
-  const createExplosion = (x: number, y: number, parentId: string) => {
+  // Updated createExplosion function to ensure fragments have unique coordinates
+  const createExplosion = (x: number, y: number, parentId: string): Atom[] => {
     // Create smaller atoms from explosion
     const fragmentCount = Math.floor(Math.random() * 2) + 3; // 3-4 fragments
-    
     const newAtoms: Atom[] = [];
     
     for (let i = 0; i < fragmentCount; i++) {
@@ -761,20 +853,26 @@ for (let i = 0; i < updatedAtoms.length; i++) {
       // Create a unique ID for each fragment that references the parent atom
       const fragmentId = `fragment-${parentId}-${i}-${Date.now()}`;
       
+      // Give each fragment a slightly different starting position
+      const offsetDistance = ATOM_RADIUS * 1.2; // Enough offset to avoid conflict
+      const fragmentX = x + Math.cos(angle) * offsetDistance;
+      const fragmentY = y + Math.sin(angle) * offsetDistance;
+      
       // Create new atom with random properties
       const newAtom: Atom = {
         id: fragmentId,
-        x: x,
-        y: y,
+        x: fragmentX,
+        y: fragmentY,
         vx: Math.cos(angle) * (Math.random() * 3 + 2),
         vy: Math.sin(angle) * (Math.random() * 3 + 2),
         energy: 1,
         radius: ATOM_RADIUS * 0.8,
         color: getAtomColor(1),
-        lastCollision: 0
+        lastCollision: 0,
+        isFragment: true // Mark this as a fragment
       };
       
-      // Store the new fragment in the database
+      // Store each fragment in the database
       storeCellInDatabase(newAtom);
       
       // Queue transaction for the new fragment
@@ -783,9 +881,9 @@ for (let i = 0; i < updatedAtoms.length; i++) {
       newAtoms.push(newAtom);
     }
     
-    // Add explosion particles
-    setAtoms(prev => [...prev, ...newAtoms]);
+    return newAtoms;
   };
+  
 
   // Get atom color based on energy
   const getAtomColor = (energy: number): string => {
@@ -805,6 +903,10 @@ for (let i = 0; i < updatedAtoms.length; i++) {
       return;
     }
     
+    // Ensure coordinates are integers to match database expectation
+    const intX = Math.floor(x);
+    const intY = Math.floor(y);
+    
     // Create random velocity
     const speed = Math.random() * 1 + 0.5;
     const angle = Math.random() * Math.PI * 2;
@@ -814,28 +916,33 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     
     const newAtom: Atom = {
       id: atomId,
-      x: x,
-      y: y,
+      x: x, // Keep fractional for simulation
+      y: y, // Keep fractional for simulation
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed,
       energy: 1,
       radius: ATOM_RADIUS,
       color: getAtomColor(1),
-      lastCollision: 0
+      lastCollision: 0,
+      isFragment: false // Initial atoms are not fragments
     };
     
-    // Add to state
+    // Add to state first so user sees immediate feedback
     setAtoms(prev => [...prev, newAtom]);
     
     // Store in database
-    storeCellInDatabase(newAtom);
-    
-    // Queue transaction
-    queueAtomTransaction(newAtom);
+    storeCellInDatabase(newAtom)
+      .then(() => {
+        // Queue transaction after successful database storage
+        return queueAtomTransaction(newAtom);
+      })
+      .catch(error => {
+        console.error('Error in atom creation pipeline:', error);
+      });
     
     // Play sound
     playSound('add');
-  };
+};
 
   // Add a random atom
   const addRandomAtom = () => {
@@ -863,26 +970,29 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     }
   };
 
-  // Queue explosion transaction
-  const queueExplosion = async (atom: Atom) => {
+  // Queue explosion transaction with atom ID
+const queueExplosion = async (atom: Atom) => {
     try {
+      const x = Math.floor(atom.x);
+      const y = Math.floor(atom.y);
+      
       await addToTransactionQueue({
-        id: atom.id,       // Include the atom ID
-        x: Math.floor(atom.x),
-        y: Math.floor(atom.y),
+        id: atom.id,
+        x: x,
+        y: y,
         energy: atom.energy,
         type: txTypes.EXPLOSION
       });
       
-      // For analytics, you might want to store the exploded atom data
-      // This is optional but can be useful for tracking which atoms exploded
-      await addCell({
-        id: atom.id,
-        x: Math.floor(atom.x),
-        y: Math.floor(atom.y),
-        energy: MAX_ENERGY,
-        type: 'exploded'  // Mark this atom as exploded in the database
-      });
+      // Delete the exploded atom from the database
+      // First try by ID
+      const deleteResult = await deleteCell(atom.id);
+      
+      if (!deleteResult.success) {
+        console.error(`Failed to delete exploded atom ${atom.id}:`, deleteResult.error);
+      } else {
+        console.log(`Successfully deleted exploded atom ${atom.id}`);
+      }
       
     } catch (error) {
       console.error('Error queuing explosion transaction:', error);

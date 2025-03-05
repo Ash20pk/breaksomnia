@@ -51,34 +51,44 @@ export interface TransactionQueueItem {
 }
 
 /**
- * Add or update a cell in the database using ID as primary key
+ * Add or update a cell in the database
  */
 export async function addCell(cell: Cell): Promise<{ success: boolean; error?: string }> {
-  try {
-    // Ensure the cell has an ID
-    if (!cell.id) {
-      throw new Error('Cell must have an ID');
+    try {
+      const x = Math.floor(cell.x);
+      const y = Math.floor(cell.y);
+      
+      // First delete any cells with the same ID or at the same coordinates
+      const { error: deleteError } = await supabase
+        .from('cells')
+        .delete()
+        .or(`id.eq.${cell.id},and(x.eq.${x},y.eq.${y})`);
+      
+      if (deleteError) {
+        console.error('Error deleting existing cells:', deleteError);
+        // Continue anyway
+      }
+      
+      // Insert the new cell after a small delay to ensure deletion completes
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      const { error: insertError } = await supabase
+        .from('cells')
+        .insert({
+          id: cell.id,
+          x: x,
+          y: y,
+          energy: cell.energy,
+          timestamp: Date.now()
+        });
+  
+      if (insertError) throw insertError;
+      return { success: true };
+    } catch (error: any) {
+      console.error('Server Action Error - addCell:', error);
+      return { success: false, error: error.message };
     }
-
-    const { error } = await supabase
-      .from('cells')
-      .upsert({
-        id: cell.id,     // Use ID as primary key
-        x: cell.x,
-        y: cell.y,
-        energy: cell.energy,
-        timestamp: Date.now()
-      }, {
-        onConflict: 'id' // Specify conflict resolution on ID
-      });
-
-    if (error) throw error;
-    return { success: true };
-  } catch (error: any) {
-    console.error('Server Action Error - addCell:', error);
-    return { success: false, error: error.message };
   }
-}
 
 /**
  * Get all cells from the database without filtering by type
