@@ -5,19 +5,14 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { somnia } from '@/lib/chains';
 import { toast } from "sonner";
 import { 
-  addCell, 
   addToTransactionQueue,
   getPendingTransactionCount,
   getNextPendingTransaction,
   updateTransactionStatus,
   getTransactionTypes,
-  getCells,
   getRecentTransactions,
-  deleteCell,
-  getExplosionCount
+  fetchCombinedStats
 } from '@/app/action';
-import { TransactionProcessor } from '@/utils/TransactionProcessor';
-
 
 // Components
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -193,40 +188,70 @@ const AtomicChainReaction: React.FC = () => {
   const [walletClient, setWalletClient] = useState<any>(null);
   const [publicClient, setPublicClient] = useState<any>(null);
   
-  // Processing flags
-  const processingTxRef = useRef(false);
-  const isLoadingRef = useRef(false);
+  // TPS flags
+  const lastTpsTimeRef = useRef<number>(0);
+  const lastTxCountRef = useRef<number>(0);
 
   const fetchStats = async () => {
     try {
-      // Fetch pending transaction count
-      const pendingResult = await getPendingTransactionCount();
-      if (!pendingResult.error) {
-        setPendingTxCount(pendingResult.count);
-      }
+      // Use the combined stats function for more efficient querying
+      const { pendingCount, explosionCount, txCount, error } = await fetchCombinedStats();
       
-      // Fetch explosion count
-      const explosionResult = await getExplosionCount();
-      if (!explosionResult.error) {
-        setExplosionCount(explosionResult.count);
-      }
-      
-      // Fetch recent transactions to calculate total count
-      const { transactions, error } = await getRecentTransactions();
-      if (!error && transactions) {
-        // Set total transaction count (alternative to calling a separate endpoint)
-        setTxCount(transactions.length);
+      if (!error) {
+        setPendingTxCount(pendingCount);
+        setExplosionCount(explosionCount);
+        setTxCount(txCount);
+        
+        // Calculate TPS (transactions per second)
+        const now = Date.now();
+        if (lastTpsTimeRef.current > 0) {
+          const elapsed = (now - lastTpsTimeRef.current) / 1000;
+          const newTxCount = txCount - lastTxCountRef.current;
+          
+          if (elapsed > 0 && newTxCount > 0) {
+            setTps(newTxCount / elapsed);
+          }
+        }
+        
+        // Update refs for next calculation
+        lastTpsTimeRef.current = now;
+        lastTxCountRef.current = txCount;
       }
     } catch (error) {
       console.error('Error fetching stats:', error);
     }
   };
+
   
-  // Add this useEffect to poll for stats updates
+  // Update the component's useEffect for polling
   useEffect(() => {
     // Fetch stats immediately when component mounts
     fetchStats();
-
+    
+    // Also load transactions
+    loadRecentTransactions();
+    
+    // Set up more frequent polling for stats
+    const statsInterval = setInterval(fetchStats, 1000); // Poll every second
+    
+    return () => {
+      clearInterval(statsInterval);
+    };
+  }, [isPaused]);
+  
+  useEffect(() => {
+    // Fetch stats immediately when component mounts
+    fetchStats();
+    
+    // Load transaction history
+    loadRecentTransactions();
+    
+    // Set up polling interval for stats
+    const statsInterval = setInterval(fetchStats, 1000); 
+    
+    return () => {
+      clearInterval(statsInterval);
+    };
   }, [isPaused]);
 
   // Initialize transaction types from server
@@ -355,190 +380,112 @@ const loadRecentTransactions = async () => {
     }
   };
 
-  // Updated function to load atoms and transactions
-  const loadAtomsFromDatabase = async () => {
-    try {
-      // Fetch all cells from the database
-      const { cells, error } = await getCells();
-      
-      if (error) {
-        console.error('Error loading atoms from database:', error);
-        toast.error('Failed to load saved atoms');
-        return;
-      }
-      
-      console.log(`Found ${cells.length} cells in database`);
-      
-      // Also load transactions
-      await loadRecentTransactions();
-      
-      // Also load pending transaction count
-      try {
-        const result = await getPendingTransactionCount();
-        setPendingTxCount(result.count);
-        console.log(`Found ${result.count} pending transactions`);
-      } catch (error) {
-        console.error('Error getting pending transaction count:', error);
-      }
-      
-      // If no cells found, create a default atom
-      if (cells.length === 0) {
-        console.log('No atoms found in database, creating a default atom');
-        
-        // Create a new atom
-        const centerX = CANVAS_WIDTH / 2;
-        const centerY = CANVAS_HEIGHT / 2;
-        
-        setTimeout(() => {
-          addAtom(centerX, centerY);
-          toast.info('Created a new atom to start');
-        }, 500);
-        
-        return;
-      }
-      
-      // Convert database cells to Atom objects
-      const loadedAtoms: Atom[] = cells.map(cell => {
-        // Generate random velocity for the atom
-        const speed = Math.random() * 1 + 0.5;
-        const angle = Math.random() * Math.PI * 2;
-        
-        // Check if this is a fragment based on the ID prefix
-        const isFragment = cell.id.startsWith('fragment-');
-        
-        return {
-          id: cell.id,
-          x: cell.x,
-          y: cell.y,
-          vx: Math.cos(angle) * speed,
-          vy: Math.sin(angle) * speed,
-          energy: cell.energy,
-          radius: isFragment ? ATOM_RADIUS * 0.8 : ATOM_RADIUS, // Adjust radius based on type
-          color: getAtomColor(cell.energy),
-          lastCollision: 0,
-          isFragment: isFragment // Set based on ID pattern
-        };
-      });
-      
-      // Deduplicate atoms in case there are any with the same ID
-      const uniqueAtoms = deduplicateAtoms(loadedAtoms);
-      
-      // Update the atoms state with loaded atoms
-      setAtoms(uniqueAtoms);
-    } catch (error) {
-      console.error('Failed to load atoms:', error);
-    }
-  };
-
-  // Load atoms from database when component mounts
-useEffect(() => {
-    // Only load atoms if there are none already in the state
-    // This prevents reloading atoms when the component re-renders
-    if (atoms.length === 0) {
-      loadAtomsFromDatabase();
-    }
-  }, []);
 
   // Initialize transaction processor
   useEffect(() => {
     if (isPaused || !walletClient || !publicClient || !CONTRACT_ADDRESS) return;
     
     let isMounted = true;
-    const processingRef = { current: false };
     
     const processTxQueue = async () => {
-        if (processingRef.current || !isMounted) return;
+      if (!isMounted || isPaused) return;
+      
+      try {
+        const result = await getNextPendingTransaction();
         
-        processingRef.current = true;
-        
-        try {
-          const result = await getNextPendingTransaction();
-          
-          if (!isMounted) return;
-          
-          if (result.error) {
-            console.error('Error getting next pending transaction:', result.error);
-            processingRef.current = false;
-            return;
-          }
-          
-          const nextTx = result.transaction;
-          
-          if (nextTx && nextTx.id) {
-            try {
-              let hash;
-              
-              if (nextTx.type === txTypes.EXPLOSION) {
-                // Process explosion transaction with atom ID
-                const atomId = nextTx.atom_id || '';
-                const { request } = await publicClient.simulateContract({
-                  address: CONTRACT_ADDRESS as `0x${string}`,
-                  abi: ABI,
-                  functionName: 'recordExplosion',
-                  args: [atomId],
-                  account: walletClient.account
-                });
-                
-                // Send transaction
-                hash = await walletClient.writeContract({
-                  ...request,
-                });
-                
-                setExplosionCount(prev => prev + 1);
-              } else {
-                // Process regular reaction transaction with atom ID
-                const atomId = nextTx.atom_id || '';
-                const { request } = await publicClient.simulateContract({
-                  address: CONTRACT_ADDRESS as `0x${string}`,
-                  abi: ABI,
-                  functionName: 'recordReaction',
-                  args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
-                  account: walletClient.account
-                });
-                
-                // Send transaction
-                hash = await walletClient.writeContract({
-                  ...request,
-                });
-                
-                setTxCount(prev => prev + 1);
-              }
-              
-              // Update transaction status
-              await updateTransactionStatus(nextTx.id, 'sent', hash);
-              
-              // Add to transactions list with notification
-              if (isMounted) {
-                const newTransaction = {
-                  hash,
-                  atom_id: nextTx.atom_id,
-                  x: nextTx.x,
-                  y: nextTx.y,
-                  energy: nextTx.energy,
-                  timestamp: Date.now(),
-                  type: nextTx.type || txTypes.REACTION,
-                  isNew: true // Flag to identify new transactions
-                };
-                
-                handleNewTransaction(newTransaction);
-              }
-              
-            } catch (err) {
-              console.error('Transaction error:', err);
-              // Mark transaction as failed
-              await updateTransactionStatus(nextTx.id, 'failed');
-            }
-          }
-        } catch (error) {
-          console.error('Error processing transaction queue:', error);
-        } finally {
-          processingRef.current = false;
+        if (!isMounted) return;
+        if (result.error || !result.transaction) {
+          return;
         }
-      };
+        
+        const nextTx = result.transaction;
+        if (!nextTx.id) {
+          return;
+        }
+          
+        try {
+          let hash;
+          
+          if (nextTx.type === txTypes.EXPLOSION) {
+            // Process explosion transaction
+            const atomId = nextTx.atom_id || '';
+            const { request } = await publicClient.simulateContract({
+              address: CONTRACT_ADDRESS as `0x${string}`,
+              abi: ABI,
+              functionName: 'recordExplosion',
+              args: [atomId],
+              account: walletClient.account
+            });
+            
+            // Send transaction
+            hash = await walletClient.writeContract(request);
+            
+            // Update explosion count immediately for better UI responsiveness
+            setExplosionCount(prev => prev + 1);
+          } else {
+            // Process regular reaction transaction
+            const atomId = nextTx.atom_id || '';
+            const { request } = await publicClient.simulateContract({
+              address: CONTRACT_ADDRESS as `0x${string}`,
+              abi: ABI,
+              functionName: 'recordReaction',
+              args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
+              account: walletClient.account
+            });
+            
+            // Send transaction
+            hash = await walletClient.writeContract(request);
+            
+            // Update transaction count immediately for better UI responsiveness
+            setTxCount(prev => prev + 1);
+          }
+          
+          // Update transaction status
+          await updateTransactionStatus(nextTx.id, 'sent', hash);
+          
+          // Update pending count immediately
+          setPendingTxCount(prev => Math.max(0, prev - 1));
+          
+          // Add to transactions list with notification
+          const newTransaction = {
+            hash,
+            atom_id: nextTx.atom_id,
+            x: nextTx.x,
+            y: nextTx.y,
+            energy: nextTx.energy,
+            timestamp: Date.now(),
+            type: nextTx.type || txTypes.REACTION,
+            isNew: true
+          };
+          
+          handleNewTransaction(newTransaction);
+        } catch (err) {
+          console.error('Transaction error:', err);
+          // Mark transaction as failed
+          await updateTransactionStatus(nextTx.id, 'failed');
+          // Update pending count
+          setPendingTxCount(prev => Math.max(0, prev - 1));
+        }
+      } catch (error) {
+        console.error('Error processing transaction queue:', error);
+      }
+    };
     
-    const interval = setInterval(processTxQueue, 2000);
+    // Process multiple transactions concurrently
+    const processMultipleTransactions = () => {
+      if (isPaused || !isMounted) return;
+      
+      // Launch multiple parallel processing instances
+      const parallelCount = 3; // Process up to 3 transactions concurrently
+      for (let i = 0; i < parallelCount; i++) {
+        processTxQueue();
+      }
+    };
     
-    // Poll for pending transaction count
+    // Set much faster intervals with parallel processing
+    const interval = setInterval(processMultipleTransactions, 2000);
+  
+    // Also update the pending transaction count polling
     const pendingInterval = setInterval(async () => {
       if (isMounted && !isPaused) {
         try {
@@ -550,7 +497,7 @@ useEffect(() => {
           console.error('Error getting pending transaction count:', error);
         }
       }
-    }, 3000);
+    }, 500); 
     
     return () => {
       isMounted = false;
@@ -558,26 +505,6 @@ useEffect(() => {
       clearInterval(pendingInterval);
     };
   }, [walletClient, publicClient, isPaused, txTypes, CONTRACT_ADDRESS, ABI]);
-
-    useEffect(() => {
-        if (isPaused || atoms.length === 0) return;
-        
-        // Update database every 5 seconds instead of every frame
-        // This reduces database load while still keeping positions relatively updated
-        const updateInterval = setInterval(() => {
-          // Choose a subset of atoms to update each interval to spread the load
-          // For example, update 20% of atoms each time
-          const updateCount = Math.max(1, Math.ceil(atoms.length * 0.2));
-          const atomsToUpdate = atoms.slice(0, updateCount);
-          
-          // Update positions in database
-          atomsToUpdate.forEach(atom => {
-            storeCellInDatabase(atom);
-          });
-        }, 5000);
-        
-        return () => clearInterval(updateInterval);
-      }, [isPaused, atoms]);
 
   // Animation loop
   useEffect(() => {
@@ -632,43 +559,6 @@ const deduplicateAtoms = (atoms: Atom[]): Atom[] => {
     
     // Convert the Map values back to an array
     return Array.from(atomMap.values());
-  };
-
-  // Function to store cell data in the database with proper error handling
-  const storeCellInDatabase = async (atom: Atom) => {
-    try {
-      // Ensure coordinates are integers and never null
-      const x = Math.floor(atom.x) || 0; // Default to 0 if null or NaN
-      const y = Math.floor(atom.y) || 0; // Default to 0 if null or NaN
-      
-      console.log(`Storing atom ${atom.id} at position (${x}, ${y}) with energy ${atom.energy}`);
-      
-      const result = await addCell({
-        id: atom.id,
-        x: x,
-        y: y,
-        energy: atom.energy || 0 // Default to 0 if null
-      });
-      
-      if (!result.success) {
-        throw new Error(result.error || 'Unknown error storing cell');
-      }
-    } catch (error) {
-      console.error(`Error storing atom ${atom.id} in database:`, error);
-    }
-  };
-  
-  // Update function for when an atom's energy changes (e.g., during collision)
-  const updateAtomEnergy = async (atom: Atom, newEnergy: number) => {
-    // Update local state
-    atom.energy = newEnergy;
-    atom.color = getAtomColor(newEnergy);
-    
-    // Update in database
-    await storeCellInDatabase(atom);
-    
-    // Queue transaction
-    await queueAtomTransaction(atom);
   };
 
   // Draw laboratory background
@@ -808,9 +698,7 @@ for (let i = 0; i < updatedAtoms.length; i++) {
           atomA.color = getAtomColor(atomA.energy);
           atomB.color = getAtomColor(atomB.energy);
           
-          // Update atoms in database and queue transactions
-          storeCellInDatabase(atomA);
-          storeCellInDatabase(atomB);
+          // Queue transactions
           queueAtomTransaction(atomA);
           queueAtomTransaction(atomB);
           
@@ -921,11 +809,11 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     for (let i = 0; i < fragmentCount; i++) {
       const angle = (Math.PI * 2 / fragmentCount) * i;
       
-      // Create a unique ID for each fragment that references the parent atom
+      // Create a unique ID for each fragment
       const fragmentId = `fragment-${parentId}-${i}-${Date.now()}`;
       
       // Give each fragment a slightly different starting position
-      const offsetDistance = ATOM_RADIUS * 1.2; // Enough offset to avoid conflict
+      const offsetDistance = ATOM_RADIUS * 1.2;
       const fragmentX = x + Math.cos(angle) * offsetDistance;
       const fragmentY = y + Math.sin(angle) * offsetDistance;
       
@@ -940,13 +828,10 @@ for (let i = 0; i < updatedAtoms.length; i++) {
         radius: ATOM_RADIUS * 0.8,
         color: getAtomColor(1),
         lastCollision: 0,
-        isFragment: true // Mark this as a fragment
+        isFragment: true
       };
       
-      // Store each fragment in the database
-      storeCellInDatabase(newAtom);
-      
-      // Queue transaction for the new fragment
+      // Queue transaction for the new fragment without storing in DB
       queueAtomTransaction(newAtom);
       
       newAtoms.push(newAtom);
@@ -974,52 +859,44 @@ for (let i = 0; i < updatedAtoms.length; i++) {
       return;
     }
     
-    // Ensure coordinates are integers to match database expectation
-    const intX = Math.floor(x);
-    const intY = Math.floor(y);
+    // Generate a unique ID for the atom
+    const atomId = `atom-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     
     // Create random velocity
     const speed = Math.random() * 1 + 0.5;
     const angle = Math.random() * Math.PI * 2;
     
-    // Generate a unique ID for the atom
-    const atomId = `atom-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    
     const newAtom: Atom = {
       id: atomId,
-      x: x, // Keep fractional for simulation
-      y: y, // Keep fractional for simulation
+      x: x,
+      y: y,
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed,
       energy: 1,
       radius: ATOM_RADIUS,
       color: getAtomColor(1),
       lastCollision: 0,
-      isFragment: false // Initial atoms are not fragments
+      isFragment: false
     };
     
-    // Add to state first so user sees immediate feedback
+    // Add to state
     setAtoms(prev => [...prev, newAtom]);
     
-    // Store in database
-    storeCellInDatabase(newAtom)
-      .then(() => {
-        // Queue transaction after successful database storage
-        return queueAtomTransaction(newAtom);
-      })
-      .catch(error => {
-        console.error('Error in atom creation pipeline:', error);
-      });
+    // Queue transaction - don't wait for DB storage
+    queueAtomTransaction(newAtom);
     
     // Play sound
     playSound('add');
-};
+  };
 
   // Add a random atom
   const addRandomAtom = () => {
     const x = Math.random() * (CANVAS_WIDTH - ATOM_RADIUS * 2) + ATOM_RADIUS;
     const y = Math.random() * (CANVAS_HEIGHT - ATOM_RADIUS * 2) + ATOM_RADIUS;
     addAtom(x, y);
+    
+    // Increment transaction count since we're adding a new reaction
+    setTxCount(prev => prev + 1);
   };
 
   // Queue atom transaction
@@ -1034,15 +911,15 @@ for (let i = 0; i < updatedAtoms.length; i++) {
         type: txTypes.REACTION
       });
       
-      // Also update the cell in the database
-      await storeCellInDatabase(atom);
+      // Increment pending transaction count for UI responsiveness
+      setPendingTxCount(prev => prev + 1);
     } catch (error) {
       console.error('Error queuing atom transaction:', error);
     }
   };
 
   // Queue explosion transaction with atom ID
-const queueExplosion = async (atom: Atom) => {
+  const queueExplosion = async (atom: Atom) => {
     try {
       const x = Math.floor(atom.x);
       const y = Math.floor(atom.y);
@@ -1055,16 +932,7 @@ const queueExplosion = async (atom: Atom) => {
         type: txTypes.EXPLOSION
       });
       
-      // Delete the exploded atom from the database
-      // First try by ID
-      const deleteResult = await deleteCell(atom.id);
-      
-      if (!deleteResult.success) {
-        console.error(`Failed to delete exploded atom ${atom.id}:`, deleteResult.error);
-      } else {
-        console.log(`Successfully deleted exploded atom ${atom.id}`);
-      }
-      
+      // No need to delete from DB anymore
     } catch (error) {
       console.error('Error queuing explosion transaction:', error);
     }
@@ -1083,16 +951,22 @@ const queueExplosion = async (atom: Atom) => {
 
   // Generate multiple random atoms
   const generateRandomAtoms = () => {
-    const count = Math.min(10, maxAtoms - atoms.length);
+    const count = Math.floor(Math.random() * (10 - 5 + 1)) + 5;
     
-    if (count <= 0) {
-      toast.warning(`Maximum of ${maxAtoms} atoms reached!`);
-      return;
-    }
+    // Update the pending transaction count immediately
+    setPendingTxCount(prev => prev + count);
     
+    // Schedule the atom additions
     for (let i = 0; i < count; i++) {
       setTimeout(() => {
         addRandomAtom();
+        
+        // Fetch stats after the last atom is added
+        if (i === count - 1) {
+          setTimeout(() => {
+            fetchStats();
+          }, 500);
+        }
       }, i * 100);
     }
     
@@ -1174,7 +1048,7 @@ const queueExplosion = async (atom: Atom) => {
                     <span>Pos: ({tx.x}, {tx.y}) | Energy: {tx.energy}</span>
                   )}
                   {isExplosion && tx.atom_id && (
-                    <span>Atom ID: {tx.atom_id.substring(0, 10)}...</span>
+                    <span>Pos: ({tx.x}, {tx.y}) | Energy: {tx.energy}</span>
                   )}
                 </div>
               </div>
@@ -1239,12 +1113,12 @@ const queueExplosion = async (atom: Atom) => {
               {/* Atom actions */}
               <Button 
                 variant="default"
-                onClick={addRandomAtom}
+                onClick={generateRandomAtoms}
                 className="w-full flex items-center gap-1"
                 disabled={atoms.length >= maxAtoms}
               >
                 <Plus className="h-4 w-4" />
-                Add Atom
+                Start Stress Test
               </Button>
                             
               <Separator />
@@ -1288,11 +1162,6 @@ const queueExplosion = async (atom: Atom) => {
                 <div className="flex justify-between items-center">
                   <span className="text-muted-foreground">Total Transactions:</span>
                   <Badge variant="outline">{txCount}</Badge>
-                </div>
-                
-                <div className="flex justify-between items-center">
-                  <span className="text-muted-foreground">Total Explosions:</span>
-                  <Badge variant="default" className="bg-red-500">{explosionCount}</Badge>
                 </div>
                 
                 <div className="flex justify-between items-center">

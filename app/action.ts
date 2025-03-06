@@ -149,9 +149,7 @@ export async function addToTransactionQueue(
  * Get the next pending transaction from the queue
  */
 export async function getNextPendingTransaction(): Promise<{ transaction: TransactionQueueItem | null; error?: string }> {
-    console.log('getNextPendingTransaction called');
     try {
-      console.log('Querying transaction_queue table');
       const { data, error } = await supabase
         .from('transaction_queue')
         .select('*')
@@ -161,19 +159,55 @@ export async function getNextPendingTransaction(): Promise<{ transaction: Transa
         .single();
   
       if (error && error.code !== 'PGRST116') {
-        console.error('Supabase query error:', error);
         throw error;
       }
       
-      console.log('Query successful, returning data:', data ? 'Some data' : 'No data');
       return { transaction: data || null };
     } catch (error: any) {
       if (error.code === 'PGRST116') {
-        console.log('No pending transactions found');
         return { transaction: null }; // No pending transactions
       }
       console.error('Server Action Error - getNextPendingTransaction:', error);
       return { transaction: null, error: error.message };
+    }
+  }
+
+  export async function batchUpdateTransactionStatus(
+    ids: number[],
+    status: 'sent' | 'failed',
+    hashes: Record<number, string> = {}
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      // Get current retries for each transaction
+      const { data: currentTxs } = await supabase
+        .from('transaction_queue')
+        .select('id,retries')
+        .in('id', ids);
+      
+      // Create a map of id to retries
+      const retriesMap: Record<number, number> = {};
+      currentTxs?.forEach(tx => {
+        retriesMap[tx.id] = (tx.retries || 0) + 1;
+      });
+  
+      // Prepare updates
+      const updates = ids.map(id => ({
+        id,
+        status,
+        hash: hashes[id] || null,
+        retries: retriesMap[id] || 1
+      }));
+  
+      // Batch update
+      const { error } = await supabase
+        .from('transaction_queue')
+        .upsert(updates);
+  
+      if (error) throw error;
+      return { success: true };
+    } catch (error: any) {
+      console.error('Server Action Error - batchUpdateTransactionStatus:', error);
+      return { success: false, error: error.message };
     }
   }
 
@@ -313,25 +347,101 @@ export async function addExplosionToQueue(): Promise<{ success: boolean; error?:
 }
 
 /**
- * Get recent transactions
+ * Get combined stats more efficiently
  */
-export async function getRecentTransactions(): Promise<{ 
-    transactions: TransactionQueueItem[]; 
+export async function fetchCombinedStats(): Promise<{ 
+    pendingCount: number;
+    explosionCount: number;
+    txCount: number;
     error?: string 
   }> {
     try {
-      const { data, error } = await supabase
+      // Run queries in parallel
+      const [pendingResult, explosionResult, txCountResult] = await Promise.all([
+        supabase
+          .from('transaction_queue')
+          .select('count', { count: 'exact', head: true })
+          .eq('status', 'pending'),
+        
+        supabase
+          .from('transaction_queue')
+          .select('count', { count: 'exact', head: true })
+          .eq('type', TX_TYPE_EXPLOSION)
+          .eq('status', 'sent'),
+        
+        supabase
+          .from('transaction_queue')
+          .select('count', { count: 'exact', head: true })
+          .eq('status', 'sent')
+      ]);
+  
+      return {
+        pendingCount: pendingResult.count || 0,
+        explosionCount: explosionResult.count || 0,
+        txCount: txCountResult.count || 0
+      };
+    } catch (error: any) {
+      console.error('Error fetching combined stats:', error);
+      return { pendingCount: 0, explosionCount: 0, txCount: 0, error: error.message };
+    }
+  }
+  
+  /**
+   * Optimize getRecentTransactions to select only needed fields
+   */
+  export async function getRecentTransactions(limit: number = 50): Promise<{ 
+    transactions: TransactionQueueItem[]; 
+    error?: string 
+    }> {
+    try {
+        const { data, error } = await supabase
         .from('transaction_queue')
-        .select('*')
+        .select('id,atom_id,x,y,energy,status,hash,timestamp,type')
         .eq('status', 'sent')
         .order('timestamp', { ascending: false })
-        .limit(50);
+        .limit(limit);
+
+        if (error) throw error;
+        
+        // Map to ensure all required fields exist
+        const transactions: TransactionQueueItem[] = (data || []).map(tx => ({
+        id: tx.id,
+        atom_id: tx.atom_id,
+        x: tx.x,
+        y: tx.y,
+        energy: tx.energy,
+        status: tx.status || 'sent',
+        hash: tx.hash,
+        timestamp: tx.timestamp,
+        type: tx.type,
+        retries: 0 // Default value
+        }));
+        
+        return { transactions };
+    } catch (error: any) {
+        console.error('Server Action Error - getRecentTransactions:', error);
+        return { transactions: [], error: error.message };
+    }
+    }
+
+  /**
+ * Get recent transactions Count
+ */
+export async function getRecentTransactionsCount(): Promise<{ 
+    count: number; 
+    error?: string 
+  }> {
+    try {
+      const { count, error } = await supabase
+        .from('transaction_queue')
+        .select('*', { count: 'exact', head: true })
+        .eq('status', 'sent')
   
       if (error) throw error;
-      return { transactions: data || [] };
+      return { count: count || 0 };
     } catch (error: any) {
-      console.error('Server Action Error - getRecentTransactions:', error);
-      return { transactions: [], error: error.message };
+      console.error('Server Action Error - getRecentTransactionsCount:', error);
+      return { count: 0, error: error.message };
     }
   }
 

@@ -43,8 +43,8 @@ import {
       this.txTypeExplosion = explosion;
     }
   
-    // Start processing
-    start(intervalMs: number = 2000) {
+    // Start processing with faster default interval
+    start(intervalMs: number = 250) {
       this.isPaused = false;
       if (!this.processingInterval) {
         this.processingInterval = setInterval(() => this.processTxQueue(), intervalMs);
@@ -69,108 +69,93 @@ import {
       }
     }
   
-    // Process the next transaction in the queue
-    // Process the next transaction in the queue
-private async processTxQueue() {
-    if (
-      this.isProcessing || 
-      this.isPaused || 
-      !this.walletClient || 
-      !this.publicClient || 
-      !this.contractAddress
-    ) {
-      return;
-    }
-  
-    this.isProcessing = true;
-  
-    try {
-      let result;
-      try {
-        result = await getNextPendingTransaction();
-      } catch (fetchError) {
-        console.error('Network error fetching transactions:', fetchError);
-        // Add exponential backoff here if needed
-        this.isProcessing = false;
-        return;
-      }
-  
-      if (result.error) {
-        console.error('Error getting next pending transaction:', result.error);
-        this.isProcessing = false;
-        return;
-      }
-  
-      const nextTx = result.transaction;
-  
-      if (nextTx && nextTx.id) {
+    // Process transactions one at a time but with faster polling
+    private async processTxQueue() {
+        if (this.isPaused || !this.walletClient || !this.publicClient || !this.contractAddress) {
+          return;
+        }
+      
         try {
-          let hash;
-  
-          if (nextTx.type === this.txTypeExplosion) {
-            // Process explosion transaction with atom ID
-            const atomId = nextTx.atom_id || ''; // Default to empty string if no atom_id
-            const { request } = await this.publicClient.simulateContract({
-              address: this.contractAddress as `0x${string}`,
-              abi: this.abi,
-              functionName: 'recordExplosion',
-              args: [atomId],
-              account: this.walletClient.account
-            });
-  
-            // Send transaction
-            hash = await this.walletClient.writeContract({
-              ...request,
-            });
-          } else {
-            // Process regular reaction transaction with atom ID
-            const atomId = nextTx.atom_id || ''; // Default to empty string if no atom_id
-            const { request } = await this.publicClient.simulateContract({
-              address: this.contractAddress as `0x${string}`,
-              abi: this.abi,
-              functionName: 'recordReaction',
-              args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
-              account: this.walletClient.account
-            });
-  
-            // Send transaction
-            hash = await this.walletClient.writeContract({
-              ...request,
-            });
-          }
-  
-          // Update transaction status
+          let result;
           try {
-            await updateTransactionStatus(nextTx.id, 'sent', hash);
-          } catch (statusError) {
-            console.error('Error updating transaction status:', statusError);
-            // Continue processing even if update fails
+            result = await getNextPendingTransaction();
+          } catch (fetchError) {
+            console.error('Network error fetching transactions:', fetchError);
+            return;
           }
-  
-          // Call success callback
-          if (this.onSuccess) {
-            this.onSuccess({ hash, transaction: nextTx });
+      
+          if (result.error) {
+            console.error('Error getting next pending transaction:', result.error);
+            return;
           }
-        } catch (err: any) {
-          console.error('Transaction error:', err);
-          
-          // Mark transaction as failed
-          try {
-            await updateTransactionStatus(nextTx.id, 'failed');
-          } catch (statusError) {
-            console.error('Error updating failed transaction status:', statusError);
+      
+          const nextTx = result.transaction
+      
+          if (nextTx && nextTx.id) {
+            try {
+              let hash;
+      
+              if (nextTx.type === this.txTypeExplosion) {
+                // Process explosion transaction with atom ID
+                const atomId = nextTx.atom_id || ''; 
+                const { request } = await this.publicClient.simulateContract({
+                  address: this.contractAddress as `0x${string}`,
+                  abi: this.abi,
+                  functionName: 'recordExplosion',
+                  args: [atomId],
+                  account: this.walletClient.account
+                });
+      
+                // Send transaction
+                hash = await this.walletClient.writeContract({
+                  ...request,
+                });
+              } else {
+                // Process regular reaction transaction with atom ID
+                const atomId = nextTx.atom_id || '';
+                const { request } = await this.publicClient.simulateContract({
+                  address: this.contractAddress as `0x${string}`,
+                  abi: this.abi,
+                  functionName: 'recordReaction',
+                  args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
+                  account: this.walletClient.account
+                });
+      
+                // Send transaction
+                hash = await this.walletClient.writeContract({
+                  ...request,
+                });
+              }
+      
+              // Update transaction status
+              try {
+                await updateTransactionStatus(nextTx.id, 'sent', hash);
+              } catch (statusError) {
+                console.error('Error updating transaction status:', statusError);
+              }
+      
+              // Call success callback
+              if (this.onSuccess) {
+                this.onSuccess({ hash, transaction: nextTx });
+              }
+            } catch (err: any) {
+              console.error('Transaction error:', err);
+              
+              // Mark transaction as failed
+              try {
+                await updateTransactionStatus(nextTx.id, 'failed');
+              } catch (statusError) {
+                console.error('Error updating failed transaction status:', statusError);
+              }
+              
+              // Call error callback
+              if (this.onError && nextTx) {
+                this.onError(err, nextTx);
+              }
+            }
           }
-          
-          // Call error callback
-          if (this.onError && nextTx) {
-            this.onError(err, nextTx);
-          }
+        } catch (error) {
+          console.error('Error processing transaction queue:', error);
         }
       }
-    } catch (error) {
-      console.error('Error processing transaction queue:', error);
-    } finally {
-      this.isProcessing = false;
     }
-  }
-  }
