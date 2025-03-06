@@ -1066,26 +1066,27 @@ const queueExplosion = async (atom: Atom) => {
             </CardHeader>
             <CardContent className="space-y-4">
               {/* Simulation controls */}
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 gap-2">
                 <Button 
                   variant="outline" 
-                  onClick={() => setIsPaused(!isPaused)}
-                  className="flex items-center gap-1"
+                  onClick={() => {
+                    if (isPaused) {
+                      setIsPaused(false);
+                      toast.success("Reaction resumed");
+                    } else {
+                      const code = prompt("Enter nuclear code to pause reaction:");
+                      if (code === "91227") { 
+                        setIsPaused(true);
+                        toast.success("Reaction paused successfully");
+                      } else {
+                        toast.error("Invalid nuclear code");
+                      }
+                    }
+                  }}
+                  className="flex items-center justify-center gap-2"
                 >
-                  {isPaused 
-                    ? <Play className="h-4 w-4" />
-                    : <Pause className="h-4 w-4" />
-                  }
-                  {isPaused ? 'Resume' : 'Pause'}
-                </Button>
-                
-                <Button 
-                  variant="outline" 
-                  onClick={clearAtoms}
-                  className="flex items-center gap-1"
-                >
-                  <Trash2 className="h-4 w-4" />
-                  Clear
+                  {isPaused ? <Play className="h-4 w-4" /> : <ZapOff className="h-4 w-4" />}
+                  {isPaused ? "Resume Reaction" : "Pause Reaction"}
                 </Button>
               </div>
               
