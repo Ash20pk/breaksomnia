@@ -13,7 +13,8 @@ import {
   getTransactionTypes,
   getCells,
   getRecentTransactions,
-  deleteCell
+  deleteCell,
+  getExplosionCount
 } from '@/app/action';
 import { TransactionProcessor } from '@/utils/TransactionProcessor';
 
@@ -44,8 +45,28 @@ const MAX_ENERGY = 4;  // Energy level required for explosion
 const ATOM_RADIUS = 15;
 const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '';
 
+// CSS for transaction animation 
+const transactionItemStyles = `
+@keyframes highlightTransaction {
+  0% { background-color: rgba(59, 130, 246, 0.5); }
+  100% { background-color: rgba(0, 0, 0, 0); }
+}
+
+.transaction-new {
+  animation: highlightTransaction 3s ease-out forwards;
+}
+
+.transaction-explosion-new {
+  animation: highlightExplosion 3s ease-out forwards;
+}
+
+@keyframes highlightExplosion {
+  0% { background-color: rgba(239, 68, 68, 0.5); }
+  100% { background-color: rgba(0, 0, 0, 0); }
+}
+`;
+
 // ABI for our contract
-// Updated ABI for the new ChainReactionRecorder contract
 const ABI = [
     {
       name: 'recordReaction',
@@ -142,6 +163,7 @@ interface Transaction {
     energy: number;
     timestamp: number;
     type: string;
+    isNew?: boolean; // Flag to indicate if the transaction is new
 }
 
 const AtomicChainReaction: React.FC = () => {
@@ -174,6 +196,38 @@ const AtomicChainReaction: React.FC = () => {
   // Processing flags
   const processingTxRef = useRef(false);
   const isLoadingRef = useRef(false);
+
+  const fetchStats = async () => {
+    try {
+      // Fetch pending transaction count
+      const pendingResult = await getPendingTransactionCount();
+      if (!pendingResult.error) {
+        setPendingTxCount(pendingResult.count);
+      }
+      
+      // Fetch explosion count
+      const explosionResult = await getExplosionCount();
+      if (!explosionResult.error) {
+        setExplosionCount(explosionResult.count);
+      }
+      
+      // Fetch recent transactions to calculate total count
+      const { transactions, error } = await getRecentTransactions();
+      if (!error && transactions) {
+        // Set total transaction count (alternative to calling a separate endpoint)
+        setTxCount(transactions.length);
+      }
+    } catch (error) {
+      console.error('Error fetching stats:', error);
+    }
+  };
+  
+  // Add this useEffect to poll for stats updates
+  useEffect(() => {
+    // Fetch stats immediately when component mounts
+    fetchStats();
+
+  }, [isPaused]);
 
   // Initialize transaction types from server
   useEffect(() => {
@@ -235,6 +289,27 @@ const AtomicChainReaction: React.FC = () => {
     
     initBlockchain();
   }, []);
+
+  const handleNewTransaction = (newTransaction: Transaction) => {
+    // Update transactions list with the new transaction
+    setTransactions(prev => {
+      const newTransactions = [newTransaction, ...prev];
+      return newTransactions.slice(0, 50); // Keep only 50 latest
+    });
+    
+    // Show toast notification based on transaction type
+    if (newTransaction.type === txTypes.EXPLOSION) {
+      toast.success("Explosion recorded!", {
+        description: `Atom exploded at (${newTransaction.x}, ${newTransaction.y})! hash: ${newTransaction.hash.slice(0, 6)}...`,
+        icon: <Sparkles className="h-5 w-5 text-yellow-500" />
+      });
+    } else {
+      toast.info("Reaction recorded", {
+        description: `Energy: ${newTransaction.energy} at (${newTransaction.x}, ${newTransaction.y}) hash: ${newTransaction.hash.slice(0, 6)}...`,
+        icon: <Atom className="h-5 w-5 text-blue-500" />
+      });
+    }
+  };
 
   // Function to load recent transactions into the UI
 const loadRecentTransactions = async () => {
@@ -350,10 +425,8 @@ const loadRecentTransactions = async () => {
       
       // Update the atoms state with loaded atoms
       setAtoms(uniqueAtoms);
-      toast.success(`Loaded ${uniqueAtoms.length} atoms from database`);
     } catch (error) {
       console.error('Failed to load atoms:', error);
-      toast.error('Failed to load saved atoms');
     }
   };
 
@@ -374,96 +447,94 @@ useEffect(() => {
     const processingRef = { current: false };
     
     const processTxQueue = async () => {
-      if (processingRef.current || !isMounted) return;
-      
-      processingRef.current = true;
-      
-      try {
-        const result = await getNextPendingTransaction();
+        if (processingRef.current || !isMounted) return;
         
-        if (!isMounted) return;
+        processingRef.current = true;
         
-        if (result.error) {
-          console.error('Error getting next pending transaction:', result.error);
-          processingRef.current = false;
-          return;
-        }
-        
-        const nextTx = result.transaction;
-        
-        if (nextTx && nextTx.id) {
-          try {
-            let hash;
-            
-            if (nextTx.type === txTypes.EXPLOSION) {
-              // Process explosion transaction with atom ID
-              const atomId = nextTx.atom_id || '';
-              const { request } = await publicClient.simulateContract({
-                address: CONTRACT_ADDRESS as `0x${string}`,
-                abi: ABI,
-                functionName: 'recordExplosion',
-                args: [atomId],
-                account: walletClient.account
-              });
+        try {
+          const result = await getNextPendingTransaction();
+          
+          if (!isMounted) return;
+          
+          if (result.error) {
+            console.error('Error getting next pending transaction:', result.error);
+            processingRef.current = false;
+            return;
+          }
+          
+          const nextTx = result.transaction;
+          
+          if (nextTx && nextTx.id) {
+            try {
+              let hash;
               
-              // Send transaction
-              hash = await walletClient.writeContract({
-                ...request,
-              });
+              if (nextTx.type === txTypes.EXPLOSION) {
+                // Process explosion transaction with atom ID
+                const atomId = nextTx.atom_id || '';
+                const { request } = await publicClient.simulateContract({
+                  address: CONTRACT_ADDRESS as `0x${string}`,
+                  abi: ABI,
+                  functionName: 'recordExplosion',
+                  args: [atomId],
+                  account: walletClient.account
+                });
+                
+                // Send transaction
+                hash = await walletClient.writeContract({
+                  ...request,
+                });
+                
+                setExplosionCount(prev => prev + 1);
+              } else {
+                // Process regular reaction transaction with atom ID
+                const atomId = nextTx.atom_id || '';
+                const { request } = await publicClient.simulateContract({
+                  address: CONTRACT_ADDRESS as `0x${string}`,
+                  abi: ABI,
+                  functionName: 'recordReaction',
+                  args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
+                  account: walletClient.account
+                });
+                
+                // Send transaction
+                hash = await walletClient.writeContract({
+                  ...request,
+                });
+                
+                setTxCount(prev => prev + 1);
+              }
               
-              setExplosionCount(prev => prev + 1);
-            } else {
-              // Process regular reaction transaction with atom ID
-              const atomId = nextTx.atom_id || '';
-              const { request } = await publicClient.simulateContract({
-                address: CONTRACT_ADDRESS as `0x${string}`,
-                abi: ABI,
-                functionName: 'recordReaction',
-                args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
-                account: walletClient.account
-              });
+              // Update transaction status
+              await updateTransactionStatus(nextTx.id, 'sent', hash);
               
-              // Send transaction
-              hash = await walletClient.writeContract({
-                ...request,
-              });
-              
-              setTxCount(prev => prev + 1);
-            }
-            
-            // Update transaction status
-            await updateTransactionStatus(nextTx.id, 'sent', hash);
-            
-            // Add to transactions list
-            if (isMounted) {
-              setTransactions(prev => {
-                const newTransaction: Transaction = {
+              // Add to transactions list with notification
+              if (isMounted) {
+                const newTransaction = {
                   hash,
                   atom_id: nextTx.atom_id,
                   x: nextTx.x,
                   y: nextTx.y,
                   energy: nextTx.energy,
                   timestamp: Date.now(),
-                  type: nextTx.type || txTypes.REACTION
+                  type: nextTx.type || txTypes.REACTION,
+                  isNew: true // Flag to identify new transactions
                 };
                 
-                const newTransactions = [newTransaction, ...prev];
-                return newTransactions.slice(0, 50); // Keep only 50 latest
-              });
+                handleNewTransaction(newTransaction);
+              }
+              
+            } catch (err) {
+              console.error('Transaction error:', err);
+              // Mark transaction as failed
+              await updateTransactionStatus(nextTx.id, 'failed');
             }
-            
-          } catch (err: any) {
-            console.error('Transaction error:', err);
-            // Mark transaction as failed
-            await updateTransactionStatus(nextTx.id, 'failed');
           }
+        } catch (error) {
+          console.error('Error processing transaction queue:', error);
+        } finally {
+          processingRef.current = false;
         }
-      } catch (error) {
-        console.error('Error processing transaction queue:', error);
-      } finally {
-        processingRef.current = false;
-      }
-    };
+      };
     
     const interval = setInterval(processTxQueue, 2000);
     
@@ -1042,6 +1113,78 @@ const queueExplosion = async (atom: Atom) => {
     addAtom(x, y);
   };
 
+  const TransactionsList = () => {
+    // Reference to auto-scroll the container
+    const transactionsContainerRef = useRef<HTMLDivElement>(null);
+    
+    // Auto-scroll when new transactions arrive
+    useEffect(() => {
+      if (transactionsContainerRef.current && transactions.length > 0) {
+        transactionsContainerRef.current.scrollTop = 0;
+      }
+    }, [transactions.length]);
+    
+    return (
+      <div 
+        ref={transactionsContainerRef} 
+        className="h-60 overflow-y-auto space-y-2 pr-2"
+      >
+        <style>{transactionItemStyles}</style>
+        
+        {transactions.length === 0 ? (
+          <div className="text-center text-muted-foreground py-8">
+            <ZapOff className="h-8 w-8 mx-auto mb-2 opacity-50" />
+            <p>No transactions yet</p>
+          </div>
+        ) : (
+          transactions.map((tx, i) => {
+            const isExplosion = tx.type === txTypes.EXPLOSION;
+            const isNew = tx.isNew;
+            
+            // Remove the 'isNew' flag after a delay (3 seconds)
+            if (isNew) {
+              setTimeout(() => {
+                setTransactions(prev => 
+                  prev.map(item => 
+                    item.hash === tx.hash ? { ...item, isNew: false } : item
+                  )
+                );
+              }, 3000);
+            }
+            
+            return (
+              <div 
+                key={tx.hash} 
+                className={`text-xs border rounded p-2 bg-secondary/20 
+                  ${isNew ? (isExplosion ? 'transaction-explosion-new' : 'transaction-new') : ''}`}
+              >
+                <div className="flex justify-between">
+                  <span className="font-medium truncate">
+                    {tx.hash.substring(0, 10)}...
+                  </span>
+                  <Badge 
+                    variant="outline" 
+                    className={isExplosion ? "bg-red-100 dark:bg-red-900/30" : ""}
+                  >
+                    {isExplosion ? 'Explosion' : 'Reaction'}
+                  </Badge>
+                </div>
+                <div className="text-muted-foreground mt-1">
+                  {!isExplosion && (
+                    <span>Pos: ({tx.x}, {tx.y}) | Energy: {tx.energy}</span>
+                  )}
+                  {isExplosion && tx.atom_id && (
+                    <span>Atom ID: {tx.atom_id.substring(0, 10)}...</span>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="flex flex-col items-center py-6 px-4 max-w-7xl mx-auto">
       <div className="w-full mb-6">
@@ -1054,15 +1197,16 @@ const queueExplosion = async (atom: Atom) => {
         </p>
       </div>
       
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 w-full">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 w-full" style={{ height: '650px' }}>
         {/* Left sidebar - Controls */}
-        <div className="lg:col-span-3 space-y-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="flex items-center gap-2">
-                <Atom className="h-5 w-5 text-blue-500" />
-                Lab Controls
-              </CardTitle>
+        <div className="lg:col-span-3 h-full overflow-y-auto pr-2">
+          <div className="space-y-6">
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="flex items-center gap-2">
+                  <Atom className="h-5 w-5 text-blue-500" />
+                  Lab Controls
+                </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               {/* Simulation controls */}
@@ -1173,41 +1317,14 @@ const queueExplosion = async (atom: Atom) => {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="h-60 overflow-y-auto space-y-2 pr-2">
-                {transactions.length === 0 ? (
-                  <div className="text-center text-muted-foreground py-8">
-                    <ZapOff className="h-8 w-8 mx-auto mb-2 opacity-50" />
-                    <p>No transactions yet</p>
-                  </div>
-                ) : (
-                  transactions.map((tx, i) => (
-                    <div key={tx.hash} className="text-xs border rounded p-2 bg-secondary/20">
-                      <div className="flex justify-between">
-                        <span className="font-medium truncate">
-                          {tx.hash.substring(0, 10)}...
-                        </span>
-                        <Badge 
-                          variant="outline" 
-                          className={tx.type === txTypes.EXPLOSION ? "bg-red-100 dark:bg-red-900/30" : ""}
-                        >
-                          {tx.type === txTypes.EXPLOSION ? 'Explosion' : 'Reaction'}
-                        </Badge>
-                      </div>
-                      <div className="text-muted-foreground mt-1">
-                        {tx.type !== txTypes.EXPLOSION && (
-                          <span>Pos: ({tx.x}, {tx.y}) | Energy: {tx.energy}</span>
-                        )}
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
+            <TransactionsList />
             </CardContent>
           </Card>
         </div>
+        </div>
         
         {/* Main simulation area */}
-        <div className="lg:col-span-9">
+        <div className="lg:col-span-9 h-full">
           <Card className="p-4 h-full">
             <canvas 
               ref={canvasRef} 
@@ -1215,7 +1332,7 @@ const queueExplosion = async (atom: Atom) => {
               height={CANVAS_HEIGHT} 
               onClick={handleCanvasClick}
               className="w-full h-full border-2 border-gray-300 rounded-md cursor-pointer"
-            />
+              />
             
             <div className="mt-2 text-center text-sm text-muted-foreground">
               Click anywhere in the lab to add an atom. Atoms gain energy when they collide and explode at {MAX_ENERGY} energy.

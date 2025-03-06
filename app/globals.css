@@ -119,6 +119,26 @@
   --color-sidebar-ring: var(--sidebar-ring);
 }
 
+
+@keyframes highlightTransaction {
+  0% { background-color: rgba(59, 130, 246, 0.5); }
+  100% { background-color: rgba(0, 0, 0, 0); }
+}
+
+.transaction-new {
+  animation: highlightTransaction 3s ease-out forwards;
+}
+
+.transaction-explosion-new {
+  animation: highlightExplosion 3s ease-out forwards;
+}
+
+@keyframes highlightExplosion {
+  0% { background-color: rgba(239, 68, 68, 0.5); }
+  100% { background-color: rgba(0, 0, 0, 0); }
+}
+
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
