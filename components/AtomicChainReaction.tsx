@@ -7,19 +7,22 @@ import { toast } from "sonner";
 import { 
   addToTransactionQueue,
   getPendingTransactionCount,
-  getNextPendingTransaction,
-  updateTransactionStatus,
   getTransactionTypes,
   getRecentTransactions,
-  fetchCombinedStats
+  fetchCombinedStats,
+  massSubmitTransactions
 } from '@/app/action';
+import { MultiWalletProcessor } from '@/utils/MultiWalletProcessor';
+import { RotateCcw, AlertCircle, Flame, Zap } from 'lucide-react';
 
 // Components
-import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { Card, CardHeader, CardTitle, CardContent, CardFooter } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { Progress } from '@/components/ui/progress';
+import { Slider } from '@/components/ui/slider';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { 
   Beaker, 
   Atom, 
@@ -30,7 +33,9 @@ import {
   Play, 
   Trash2, 
   Sparkles, 
-  BarChart3 
+  BarChart3, 
+  Radiation,
+  Bomb
 } from 'lucide-react';
 
 // Constants
@@ -58,6 +63,17 @@ const transactionItemStyles = `
 @keyframes highlightExplosion {
   0% { background-color: rgba(239, 68, 68, 0.5); }
   100% { background-color: rgba(0, 0, 0, 0); }
+}
+
+@keyframes pulsate {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.stress-test-active {
+  animation: pulsate 0.5s infinite;
+  background-color: rgba(220, 38, 38, 0.2);
 }
 `;
 
@@ -161,6 +177,17 @@ interface Transaction {
     isNew?: boolean; // Flag to indicate if the transaction is new
 }
 
+// StressTest config interface
+interface StressTestConfig {
+  enabled: boolean;
+  interval: number;
+  batchSize: number;
+  currentCount: number;
+  targetCount: number;
+  timeStart?: number;
+  timeEnd?: number;
+}
+
 const AtomicChainReaction: React.FC = () => {
   // Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -176,7 +203,23 @@ const AtomicChainReaction: React.FC = () => {
   const [explosionCount, setExplosionCount] = useState(0);
   const [tps, setTps] = useState(0);
   const [maxAtoms, setMaxAtoms] = useState(50);
-  const [showStats, setShowStats] = useState(false);
+  const [showStats, setShowStats] = useState(true);
+  const [processor, setProcessor] = useState<MultiWalletProcessor | null>(null);
+  const [walletStatus, setWalletStatus] = useState<any[]>([]);
+  const [processingConfig, setProcessingConfig] = useState({
+    walletCount: 5,  // Increased wallet count
+    processingInterval: 100, // Faster processing
+    batchSize: 5 // Batch processing
+  });
+  
+  // Stress test configuration
+  const [stressTest, setStressTest] = useState<StressTestConfig>({
+    enabled: false,
+    interval: 500,
+    batchSize: 50,
+    currentCount: 0,
+    targetCount: 10000
+  });
   
   // Transaction type constants
   const [txTypes, setTxTypes] = useState({
@@ -191,7 +234,11 @@ const AtomicChainReaction: React.FC = () => {
   // TPS flags
   const lastTpsTimeRef = useRef<number>(0);
   const lastTxCountRef = useRef<number>(0);
+  const peakTpsRef = useRef<number>(0);
+  const [peakTps, setPeakTps] = useState(0);
+  const stressTestIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Function to fetch stats from server
   const fetchStats = async () => {
     try {
       // Use the combined stats function for more efficient querying
@@ -209,7 +256,14 @@ const AtomicChainReaction: React.FC = () => {
           const newTxCount = txCount - lastTxCountRef.current;
           
           if (elapsed > 0 && newTxCount > 0) {
-            setTps(newTxCount / elapsed);
+            const currentTps = newTxCount / elapsed;
+            setTps(currentTps);
+            
+            // Update peak TPS
+            if (currentTps > peakTpsRef.current) {
+              peakTpsRef.current = currentTps;
+              setPeakTps(currentTps);
+            }
           }
         }
         
@@ -222,7 +276,6 @@ const AtomicChainReaction: React.FC = () => {
     }
   };
 
-  
   // Update the component's useEffect for polling
   useEffect(() => {
     // Fetch stats immediately when component mounts
@@ -233,21 +286,6 @@ const AtomicChainReaction: React.FC = () => {
     
     // Set up more frequent polling for stats
     const statsInterval = setInterval(fetchStats, 1000); // Poll every second
-    
-    return () => {
-      clearInterval(statsInterval);
-    };
-  }, [isPaused]);
-  
-  useEffect(() => {
-    // Fetch stats immediately when component mounts
-    fetchStats();
-    
-    // Load transaction history
-    loadRecentTransactions();
-    
-    // Set up polling interval for stats
-    const statsInterval = setInterval(fetchStats, 1000); 
     
     return () => {
       clearInterval(statsInterval);
@@ -271,14 +309,26 @@ const AtomicChainReaction: React.FC = () => {
     fetchTransactionTypes();
   }, []);
 
-  // Initialize blockchain connection
+  // Initialize blockchain connection with enhanced processor
   useEffect(() => {
     const initBlockchain = async () => {
       try {
-        const privateKey = process.env.NEXT_PUBLIC_PRIVATE_KEY || '';
+        // Define wallet private keys - support up to 10 wallets for parallel processing
+        const privateKeys = [
+          process.env.NEXT_PUBLIC_PRIVATE_KEY || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_2 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_3 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_4 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_5 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_6 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_7 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_8 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_9 || '',
+          process.env.NEXT_PUBLIC_PRIVATE_KEY_10 || '',
+        ].filter(key => key !== ''); // Filter out empty keys
         
-        if (!privateKey) {
-          console.warn("No private key provided. Running in view-only mode.");
+        if (privateKeys.length === 0) {
+          console.warn("No private keys provided. Running in view-only mode.");
           const client = createPublicClient({
             chain: somnia,
             transport: http(process.env.NEXT_PUBLIC_SOMNIA_RPC_URL || 'https://dream-rpc.somnia.network')
@@ -286,26 +336,76 @@ const AtomicChainReaction: React.FC = () => {
           setPublicClient(client);
           return;
         }
-
-        // Create account from private key
-        const account = privateKeyToAccount(privateKey as `0x${string}`);
-        
-        // Create wallet client
-        const wallet = createWalletClient({
-          account,
-          chain: somnia,
-          transport: http(process.env.NEXT_PUBLIC_SOMNIA_RPC_URL || 'https://dream-rpc.somnia.network')
-        });
-        setWalletClient(wallet);
-        
-        // Create public client
+  
+        // Initialize public client for monitoring
         const client = createPublicClient({
           chain: somnia,
           transport: http(process.env.NEXT_PUBLIC_SOMNIA_RPC_URL || 'https://dream-rpc.somnia.network')
         });
         setPublicClient(client);
         
-        toast.success('Connected to blockchain');
+        // Initialize the enhanced multi-wallet processor with improved parameters
+        const multiProcessor = new MultiWalletProcessor({
+          privateKeys,
+          contractAddress: CONTRACT_ADDRESS,
+          abi: ABI,
+          rpcUrl: process.env.NEXT_PUBLIC_SOMNIA_RPC_URL || 'https://dream-rpc.somnia.network',
+          onSuccess: ({ hash, transaction, walletIndex }) => {
+            // Handle successful transaction
+            const newTransaction = {
+              hash,
+              atom_id: transaction.atom_id,
+              x: transaction.x,
+              y: transaction.y,
+              energy: transaction.energy,
+              timestamp: Date.now(),
+              type: transaction.type || txTypes.REACTION,
+              isNew: true
+            };
+            
+            handleNewTransaction(newTransaction);
+            
+            // Update stats immediately
+            if (transaction.type === txTypes.EXPLOSION) {
+              setExplosionCount(prev => prev + 1);
+            } else {
+              setTxCount(prev => prev + 1);
+            }
+            
+            // Update pending count
+            setPendingTxCount(prev => Math.max(0, prev - 1));
+          },
+          onError: (error, transaction, walletIndex) => {
+            console.error(`Wallet ${walletIndex} error:`, error);
+            setPendingTxCount(prev => Math.max(0, prev - 1));
+            
+            // Show error toast for severe errors
+            if (walletIndex !== undefined && error.message) {
+              if (error.message.includes('rate limit') || error.message.includes('nonce too low')) {
+                // Don't show toast for common errors during stress testing
+                console.warn(`Wallet ${walletIndex}: ${error.message.substring(0, 100)}...`);
+              } else {
+                toast.error(`Wallet ${walletIndex} error: ${error.message.substring(0, 50)}...`);
+              }
+            }
+          },
+          onStatusUpdate: (status) => {
+            setWalletStatus(status);
+          }
+        });
+        
+        // Set transaction types
+        multiProcessor.setTransactionTypes(txTypes.REACTION, txTypes.EXPLOSION);
+        
+        // Store the processor
+        setProcessor(multiProcessor);
+        
+        // Start processing if not paused
+        if (!isPaused) {
+          multiProcessor.start(processingConfig.processingInterval);
+        }
+        
+        toast.success(`Connected with ${privateKeys.length} wallets for parallel processing`);
       } catch (error) {
         console.error("Blockchain connection error:", error);
         toast.error("Failed to connect to blockchain. Operating in view-only mode.");
@@ -315,6 +415,95 @@ const AtomicChainReaction: React.FC = () => {
     initBlockchain();
   }, []);
 
+  // Control processor based on pause state
+  useEffect(() => {
+    if (!processor) return;
+    
+    if (isPaused) {
+      processor.pause();
+      toast.info("Transaction processing paused");
+      
+      // Also pause stress testing if active
+      if (stressTest.enabled) {
+        setStressTest(prev => ({ ...prev, enabled: false }));
+      }
+    } else {
+      processor.resume();
+      processor.start(processingConfig.processingInterval);
+      toast.success("Transaction processing resumed");
+    }
+    
+    return () => {
+      processor.stop();
+    };
+  }, [isPaused, processor, processingConfig.processingInterval]);
+
+  // Stress test effect
+  useEffect(() => {
+    if (stressTest.enabled && !isPaused) {
+      // Start the stress test
+      if (!stressTest.timeStart) {
+        setStressTest(prev => ({ 
+          ...prev, 
+          timeStart: Date.now(),
+          currentCount: 0 
+        }));
+      }
+      
+      // Create an interval to submit transactions
+      if (stressTestIntervalRef.current) {
+        clearInterval(stressTestIntervalRef.current);
+      }
+      
+      stressTestIntervalRef.current = setInterval(async () => {
+        if (stressTest.currentCount >= stressTest.targetCount) {
+          // Stop when target reached
+          setStressTest(prev => ({ 
+            ...prev, 
+            enabled: false, 
+            timeEnd: Date.now() 
+          }));
+          
+          if (stressTestIntervalRef.current) {
+            clearInterval(stressTestIntervalRef.current);
+            stressTestIntervalRef.current = null;
+          }
+          
+          toast.success(`Stress test completed! Submitted ${stressTest.currentCount} transactions.`);
+          return;
+        }
+        
+        try {
+          // Submit a batch of transactions
+          const result = await massSubmitTransactions(stressTest.batchSize);
+          if (result.success) {
+            setStressTest(prev => ({ 
+              ...prev, 
+              currentCount: prev.currentCount + result.count 
+            }));
+            setPendingTxCount(prev => prev + result.count);
+          }
+        } catch (error) {
+          console.error('Error in stress test:', error);
+        }
+      }, stressTest.interval);
+      
+      return () => {
+        if (stressTestIntervalRef.current) {
+          clearInterval(stressTestIntervalRef.current);
+          stressTestIntervalRef.current = null;
+        }
+      };
+    } else {
+      // Clear interval when not running
+      if (stressTestIntervalRef.current) {
+        clearInterval(stressTestIntervalRef.current);
+        stressTestIntervalRef.current = null;
+      }
+    }
+  }, [stressTest.enabled, stressTest.interval, stressTest.batchSize, stressTest.targetCount, stressTest.currentCount, isPaused]);
+
+  // Handle new transaction notifications
   const handleNewTransaction = (newTransaction: Transaction) => {
     // Update transactions list with the new transaction
     setTransactions(prev => {
@@ -322,13 +511,14 @@ const AtomicChainReaction: React.FC = () => {
       return newTransactions.slice(0, 50); // Keep only 50 latest
     });
     
-    // Show toast notification based on transaction type
+    // Only show toast for explosions or limit notifications during high volume
     if (newTransaction.type === txTypes.EXPLOSION) {
       toast.success("Explosion recorded!", {
         description: `Atom exploded at (${newTransaction.x}, ${newTransaction.y})! hash: ${newTransaction.hash.slice(0, 6)}...`,
         icon: <Sparkles className="h-5 w-5 text-yellow-500" />
       });
-    } else {
+    } else if (pendingTxCount < 50 && !stressTest.enabled) {
+      // Only show reaction toasts when not stress testing
       toast.info("Reaction recorded", {
         description: `Energy: ${newTransaction.energy} at (${newTransaction.x}, ${newTransaction.y}) hash: ${newTransaction.hash.slice(0, 6)}...`,
         icon: <Atom className="h-5 w-5 text-blue-500" />
@@ -336,8 +526,61 @@ const AtomicChainReaction: React.FC = () => {
     }
   };
 
+  // Wallet status display component
+  const WalletStatusDisplay = () => {
+    if (!walletStatus.length) return null;
+    
+    // Calculate total TPS across all wallets
+    const totalWalletTps = walletStatus.reduce((sum, wallet) => sum + (wallet.tps || 0), 0);
+    
+    return (
+      <div className="space-y-2 mt-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-medium">Wallet Status</h3>
+          <Badge variant="outline" className="text-xs">
+            Total TPS: {totalWalletTps.toFixed(1)}
+          </Badge>
+        </div>
+        
+        <div className="grid grid-cols-2 gap-2">
+          {walletStatus.map((wallet) => (
+            <div 
+              key={wallet.index} 
+              className={`text-xs flex items-center justify-between p-2 rounded border 
+                ${wallet.consecutiveErrors >= 5 ? 'bg-red-100 dark:bg-red-900/30 border-red-300' : 
+                  wallet.isProcessing ? 'bg-blue-100 dark:bg-blue-900/30 border-blue-300' : 
+                  'bg-gray-100 dark:bg-gray-800 border-gray-300'}`}
+            >
+              <div className="flex items-center gap-1">
+                <span>W{wallet.index + 1}</span>
+                {wallet.isProcessing && <span className="animate-pulse">⚡</span>}
+                {wallet.consecutiveErrors >= 5 && <AlertCircle className="h-3 w-3 text-red-500" />}
+              </div>
+              <div className="flex items-center gap-1 text-xs">
+                <span>{wallet.totalProcessed}</span>
+                <Badge variant="outline" className="text-xs">
+                  {wallet.tps?.toFixed(1) || 0}/s
+                </Badge>
+                {wallet.consecutiveErrors >= 5 && (
+                  <Button 
+                    variant="ghost" 
+                    size="icon" 
+                    className="h-4 w-4 p-0"
+                    onClick={() => processor?.resetWallet(wallet.index)}
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                  </Button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
   // Function to load recent transactions into the UI
-const loadRecentTransactions = async () => {
+  const loadRecentTransactions = async () => {
     try {
       console.log('Loading recent transactions...');
       
@@ -379,132 +622,6 @@ const loadRecentTransactions = async () => {
       toast.error('Failed to load transaction history');
     }
   };
-
-
-  // Initialize transaction processor
-  useEffect(() => {
-    if (isPaused || !walletClient || !publicClient || !CONTRACT_ADDRESS) return;
-    
-    let isMounted = true;
-    
-    const processTxQueue = async () => {
-      if (!isMounted || isPaused) return;
-      
-      try {
-        const result = await getNextPendingTransaction();
-        
-        if (!isMounted) return;
-        if (result.error || !result.transaction) {
-          return;
-        }
-        
-        const nextTx = result.transaction;
-        if (!nextTx.id) {
-          return;
-        }
-          
-        try {
-          let hash;
-          
-          if (nextTx.type === txTypes.EXPLOSION) {
-            // Process explosion transaction
-            const atomId = nextTx.atom_id || '';
-            const { request } = await publicClient.simulateContract({
-              address: CONTRACT_ADDRESS as `0x${string}`,
-              abi: ABI,
-              functionName: 'recordExplosion',
-              args: [atomId],
-              account: walletClient.account
-            });
-            
-            // Send transaction
-            hash = await walletClient.writeContract(request);
-            
-            // Update explosion count immediately for better UI responsiveness
-            setExplosionCount(prev => prev + 1);
-          } else {
-            // Process regular reaction transaction
-            const atomId = nextTx.atom_id || '';
-            const { request } = await publicClient.simulateContract({
-              address: CONTRACT_ADDRESS as `0x${string}`,
-              abi: ABI,
-              functionName: 'recordReaction',
-              args: [BigInt(nextTx.x), BigInt(nextTx.y), BigInt(nextTx.energy), atomId],
-              account: walletClient.account
-            });
-            
-            // Send transaction
-            hash = await walletClient.writeContract(request);
-            
-            // Update transaction count immediately for better UI responsiveness
-            setTxCount(prev => prev + 1);
-          }
-          
-          // Update transaction status
-          await updateTransactionStatus(nextTx.id, 'sent', hash);
-          
-          // Update pending count immediately
-          setPendingTxCount(prev => Math.max(0, prev - 1));
-          
-          // Add to transactions list with notification
-          const newTransaction = {
-            hash,
-            atom_id: nextTx.atom_id,
-            x: nextTx.x,
-            y: nextTx.y,
-            energy: nextTx.energy,
-            timestamp: Date.now(),
-            type: nextTx.type || txTypes.REACTION,
-            isNew: true
-          };
-          
-          handleNewTransaction(newTransaction);
-        } catch (err) {
-          console.error('Transaction error:', err);
-          // Mark transaction as failed
-          await updateTransactionStatus(nextTx.id, 'failed');
-          // Update pending count
-          setPendingTxCount(prev => Math.max(0, prev - 1));
-        }
-      } catch (error) {
-        console.error('Error processing transaction queue:', error);
-      }
-    };
-    
-    // Process multiple transactions concurrently
-    const processMultipleTransactions = () => {
-      if (isPaused || !isMounted) return;
-      
-      // Launch multiple parallel processing instances
-      const parallelCount = 3; // Process up to 3 transactions concurrently
-      for (let i = 0; i < parallelCount; i++) {
-        processTxQueue();
-      }
-    };
-    
-    // Set much faster intervals with parallel processing
-    const interval = setInterval(processMultipleTransactions, 2000);
-  
-    // Also update the pending transaction count polling
-    const pendingInterval = setInterval(async () => {
-      if (isMounted && !isPaused) {
-        try {
-          const result = await getPendingTransactionCount();
-          if (isMounted) {
-            setPendingTxCount(result.count);
-          }
-        } catch (error) {
-          console.error('Error getting pending transaction count:', error);
-        }
-      }
-    }, 500); 
-    
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-      clearInterval(pendingInterval);
-    };
-  }, [walletClient, publicClient, isPaused, txTypes, CONTRACT_ADDRESS, ABI]);
 
   // Animation loop
   useEffect(() => {
@@ -548,7 +665,7 @@ const loadRecentTransactions = async () => {
   }, [isPaused, atoms]);
 
   // Function to prevent duplicate atoms with the same ID
-const deduplicateAtoms = (atoms: Atom[]): Atom[] => {
+  const deduplicateAtoms = (atoms: Atom[]): Atom[] => {
     // Create a Map using atom IDs as keys to ensure uniqueness
     const atomMap = new Map<string, Atom>();
     
@@ -591,6 +708,23 @@ const deduplicateAtoms = (atoms: Atom[]): Atom[] => {
     ctx.strokeStyle = '#6b7280';
     ctx.lineWidth = 3;
     ctx.strokeRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    
+    // Draw stress test indicator if active
+    if (stressTest.enabled) {
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.1)';
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      
+      // Draw progress
+      const progress = stressTest.currentCount / stressTest.targetCount;
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.3)';
+      ctx.fillRect(0, 0, CANVAS_WIDTH * progress, 10);
+      
+      // Draw text
+      ctx.fillStyle = '#ef4444';
+      ctx.font = '16px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText(`STRESS TEST IN PROGRESS: ${stressTest.currentCount}/${stressTest.targetCount}`, CANVAS_WIDTH/2, 30);
+    }
   };
 
   // Update atoms positions, check collisions, and draw
@@ -630,129 +764,130 @@ const deduplicateAtoms = (atoms: Atom[]): Atom[] => {
     }
     
     // Second pass: Atom-to-atom collisions
-    // Second pass: Atom-to-atom collisions
-for (let i = 0; i < updatedAtoms.length; i++) {
-    for (let j = i + 1; j < updatedAtoms.length; j++) {
-      const atomA = updatedAtoms[i];
-      const atomB = updatedAtoms[j];
-      
-      // Skip if either atom has already been processed for explosion
-      if (atomA.energy >= MAX_ENERGY || atomB.energy >= MAX_ENERGY) continue;
-      
-      // Calculate distance between atoms
-      const dx = atomB.x - atomA.x;
-      const dy = atomB.y - atomA.y;
-      const distance = Math.sqrt(dx * dx + dy * dy);
-      
-      // Check for collision
-      if (distance < atomA.radius + atomB.radius) {
-        // Create a unique collision ID
-        const collisionId = [atomA.id, atomB.id].sort().join('_');
+    for (let i = 0; i < updatedAtoms.length; i++) {
+      for (let j = i + 1; j < updatedAtoms.length; j++) {
+        const atomA = updatedAtoms[i];
+        const atomB = updatedAtoms[j];
         
-        // Check if this collision was already processed recently
-        const now = Date.now();
-        if (now - atomA.lastCollision > 500 && now - atomB.lastCollision > 500 && !collisionsProcessed.has(collisionId)) {
-          collisionsProcessed.add(collisionId);
+        // Skip if either atom has already been processed for explosion
+        if (atomA.energy >= MAX_ENERGY || atomB.energy >= MAX_ENERGY) continue;
+        
+        // Calculate distance between atoms
+        const dx = atomB.x - atomA.x;
+        const dy = atomB.y - atomA.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        
+        // Check for collision
+        if (distance < atomA.radius + atomB.radius) {
+          // Create a unique collision ID
+          const collisionId = [atomA.id, atomB.id].sort().join('_');
           
-          // Collision response - physics
-          const nx = dx / distance;
-          const ny = dy / distance;
-          
-          // Relative velocity
-          const vx = atomB.vx - atomA.vx;
-          const vy = atomB.vy - atomA.vy;
-          
-          // Relative velocity along normal
-          const velAlongNormal = vx * nx + vy * ny;
-          
-          // Skip if atoms are moving away from each other
-          if (velAlongNormal > 0) continue;
-          
-          // Bounce effect - simplified physics
-          const bounceFactor = 1.5; // More energetic bounce
-          
-          // New velocities
-          const dv = velAlongNormal * bounceFactor;
-          
-          atomA.vx -= nx * dv;
-          atomA.vy -= ny * dv;
-          atomB.vx += nx * dv;
-          atomB.vy += ny * dv;
-          
-          // Move atoms apart to prevent sticking
-          const overlap = (atomA.radius + atomB.radius - distance) * 0.5;
-          atomA.x -= nx * overlap;
-          atomA.y -= ny * overlap;
-          atomB.x += nx * overlap;
-          atomB.y += ny * overlap;
-          
-          // Increase energy for both atoms
-          atomA.energy += 1;
-          atomB.energy += 1;
-          
-          // Update last collision time
-          atomA.lastCollision = now;
-          atomB.lastCollision = now;
-          
-          // Update energy colors
-          atomA.color = getAtomColor(atomA.energy);
-          atomB.color = getAtomColor(atomB.energy);
-          
-          // Queue transactions
-          queueAtomTransaction(atomA);
-          queueAtomTransaction(atomB);
-          
-          // Play collision sound
-          playSound('collision');
+          // Check if this collision was already processed recently
+          const now = Date.now();
+          if (now - atomA.lastCollision > 500 && now - atomB.lastCollision > 500 && !collisionsProcessed.has(collisionId)) {
+            collisionsProcessed.add(collisionId);
+            
+            // Collision response - physics
+            const nx = dx / distance;
+            const ny = dy / distance;
+            
+            // Relative velocity
+            const vx = atomB.vx - atomA.vx;
+            const vy = atomB.vy - atomA.vy;
+            
+            // Relative velocity along normal
+            const velAlongNormal = vx * nx + vy * ny;
+            
+            // Skip if atoms are moving away from each other
+            if (velAlongNormal > 0) continue;
+            
+            // Bounce effect - simplified physics
+            const bounceFactor = 1.5; // More energetic bounce
+            
+            // New velocities
+            const dv = velAlongNormal * bounceFactor;
+            
+            atomA.vx -= nx * dv;
+            atomA.vy -= ny * dv;
+            atomB.vx += nx * dv;
+            atomB.vy += ny * dv;
+            
+            // Move atoms apart to prevent sticking
+            const overlap = (atomA.radius + atomB.radius - distance) * 0.5;
+            atomA.x -= nx * overlap;
+            atomA.y -= ny * overlap;
+            atomB.x += nx * overlap;
+            atomB.y += ny * overlap;
+            
+            // Increase energy for both atoms
+            atomA.energy += 1;
+            atomB.energy += 1;
+            
+            // Update last collision time
+            atomA.lastCollision = now;
+            atomB.lastCollision = now;
+            
+            // Update energy colors
+            atomA.color = getAtomColor(atomA.energy);
+            atomB.color = getAtomColor(atomB.energy);
+            
+            // Queue transactions in batches for efficiency
+            if (!stressTest.enabled) {
+              queueAtomTransaction(atomA);
+              queueAtomTransaction(atomB);
+            }
+            
+            // Play collision sound
+            playSound('collision');
+          }
         }
       }
     }
-  }
     
     // Check for explosions in updateAtoms function
     for (let i = updatedAtoms.length - 1; i >= 0; i--) {
-    const atom = updatedAtoms[i];
-    
-    if (atom.energy >= MAX_ENERGY) {
-      // Queue explosion transaction with atom ID before removing it
-      queueExplosion(atom);
+      const atom = updatedAtoms[i];
       
-      // If it's a fragment, just remove it without creating new fragments
-      if (atom.isFragment) {
-        // Simply remove the fragment
-        updatedAtoms.splice(i, 1);
-      } else {
-        // For regular atoms, create explosion effect and collect new fragments
-        const fragments = createExplosion(atom.x, atom.y, atom.id);
-        newFragments = [...newFragments, ...fragments];
+      if (atom.energy >= MAX_ENERGY) {
+        // Queue explosion transaction with atom ID before removing it
+        queueExplosion(atom);
         
-        // Remove the exploded atom
-        updatedAtoms.splice(i, 1);
+        // If it's a fragment, just remove it without creating new fragments
+        if (atom.isFragment) {
+          // Simply remove the fragment
+          updatedAtoms.splice(i, 1);
+        } else {
+          // For regular atoms, create explosion effect and collect new fragments
+          const fragments = createExplosion(atom.x, atom.y, atom.id);
+          newFragments = [...newFragments, ...fragments];
+          
+          // Remove the exploded atom
+          updatedAtoms.splice(i, 1);
+        }
+        
+        // Play explosion sound
+        playSound('explosion');
+        
+        // Update explosion count
+        setExplosionCount(prev => prev + 1);
       }
-      
-      // Play explosion sound
-      playSound('explosion');
-      
-      // Update explosion count
-      setExplosionCount(prev => prev + 1);
     }
-  }
-  
-  // Draw atoms
-  updatedAtoms.forEach(atom => {
-    drawAtom(ctx, atom);
-  });
-  
-  // Draw new fragments
-  newFragments.forEach(atom => {
-    drawAtom(ctx, atom);
-  });
-  
-  // Update atoms state if needed, including both updated atoms and new fragments
-  if (JSON.stringify(atoms) !== JSON.stringify([...updatedAtoms, ...newFragments])) {
-    setAtoms([...updatedAtoms, ...newFragments]);
-  }
-};
+    
+    // Draw atoms
+    updatedAtoms.forEach(atom => {
+      drawAtom(ctx, atom);
+    });
+    
+    // Draw new fragments
+    newFragments.forEach(atom => {
+      drawAtom(ctx, atom);
+    });
+    
+    // Update atoms state if needed, including both updated atoms and new fragments
+    if (JSON.stringify(atoms) !== JSON.stringify([...updatedAtoms, ...newFragments])) {
+      setAtoms([...updatedAtoms, ...newFragments]);
+    }
+  };
 
   // Draw a single atom
   const drawAtom = (ctx: CanvasRenderingContext2D, atom: Atom) => {
@@ -832,7 +967,9 @@ for (let i = 0; i < updatedAtoms.length; i++) {
       };
       
       // Queue transaction for the new fragment without storing in DB
-      queueAtomTransaction(newAtom);
+      if (!stressTest.enabled) {
+        queueAtomTransaction(newAtom);
+      }
       
       newAtoms.push(newAtom);
     }
@@ -840,7 +977,6 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     return newAtoms;
   };
   
-
   // Get atom color based on energy
   const getAtomColor = (energy: number): string => {
     switch (energy) {
@@ -931,8 +1067,6 @@ for (let i = 0; i < updatedAtoms.length; i++) {
         energy: atom.energy,
         type: txTypes.EXPLOSION
       });
-      
-      // No need to delete from DB anymore
     } catch (error) {
       console.error('Error queuing explosion transaction:', error);
     }
@@ -973,6 +1107,39 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     toast.success(`Added ${count} random atoms`);
   };
 
+  // Start a stress test with specified parameters
+  const startStressTest = (targetCount: number = 1000, batchSize: number = 50, interval: number = 200) => {
+    setStressTest({
+      enabled: true,
+      interval: interval,
+      batchSize: batchSize,
+      currentCount: 0,
+      targetCount: targetCount,
+      timeStart: Date.now()
+    });
+    
+    toast.info(`Starting stress test with target ${targetCount} transactions`, {
+      description: `Batch size: ${batchSize}, Interval: ${interval}ms`,
+      icon: <Flame className="h-5 w-5 text-red-500" />
+    });
+  };
+
+  // Stop the stress test
+  const stopStressTest = () => {
+    setStressTest(prev => ({ 
+      ...prev, 
+      enabled: false,
+      timeEnd: Date.now()
+    }));
+    
+    if (stressTestIntervalRef.current) {
+      clearInterval(stressTestIntervalRef.current);
+      stressTestIntervalRef.current = null;
+    }
+    
+    toast.success(`Stress test stopped after ${stressTest.currentCount} transactions`);
+  };
+
   // Handle canvas click
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (isPaused) return;
@@ -987,6 +1154,7 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     addAtom(x, y);
   };
 
+  // Display recent transactions
   const TransactionsList = () => {
     // Reference to auto-scroll the container
     const transactionsContainerRef = useRef<HTMLDivElement>(null);
@@ -1028,7 +1196,7 @@ for (let i = 0; i < updatedAtoms.length; i++) {
             
             return (
               <div 
-                key={tx.hash} 
+                key={`${tx.hash || tx.atom_id || ''}-${i}`}
                 className={`text-xs border rounded p-2 bg-secondary/20 
                   ${isNew ? (isExplosion ? 'transaction-explosion-new' : 'transaction-new') : ''}`}
               >
@@ -1059,6 +1227,174 @@ for (let i = 0; i < updatedAtoms.length; i++) {
     );
   };
 
+  // Stress test controls
+  const StressTestControls = () => {
+    const [targetCount, setTargetCount] = useState(10000);
+    const [batchSize, setBatchSize] = useState(50);
+    const [interval, setInterval] = useState(500);
+    
+    return (
+      <Card className={stressTest.enabled ? "stress-test-active" : ""}>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center gap-2">
+            <Radiation className="h-5 w-5 text-red-500" />
+            Chain Stress Test
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Target Transactions:</span>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">{targetCount}</span>
+                <input
+                  type="range"
+                  min={1000}
+                  max={100000}
+                  step={1000}
+                  value={targetCount}
+                  onChange={(e) => setTargetCount(parseInt(e.target.value))}
+                  disabled={stressTest.enabled}
+                  className="w-24"
+                />
+              </div>
+            </div>
+            
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Batch Size:</span>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">{batchSize}</span>
+                <input
+                  type="range"
+                  min={10}
+                  max={500}
+                  step={10}
+                  value={batchSize}
+                  onChange={(e) => setBatchSize(parseInt(e.target.value))}
+                  disabled={stressTest.enabled}
+                  className="w-24"
+                />
+              </div>
+            </div>
+            
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Interval (ms):</span>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">{interval}</span>
+                <input
+                  type="range"
+                  min={50}
+                  max={1000}
+                  step={50}
+                  value={interval}
+                  onChange={(e) => setInterval(parseInt(e.target.value))}
+                  disabled={stressTest.enabled}
+                  className="w-24"
+                />
+              </div>
+            </div>
+          </div>
+          
+          <Separator />
+          
+          <div className="flex justify-between gap-2">
+            {!stressTest.enabled ? (
+              <Button 
+                variant="destructive"
+                className="w-full"
+                onClick={() => startStressTest(targetCount, batchSize, interval)}
+                disabled={isPaused}
+              >
+                <Bomb className="h-4 w-4 mr-1" />
+                Launch Attack
+              </Button>
+            ) : (
+              <Button 
+                variant="outline"
+                className="w-full"
+                onClick={stopStressTest}
+              >
+                <ZapOff className="h-4 w-4 mr-1" />
+                Stop Attack ({Math.round((stressTest.currentCount / stressTest.targetCount) * 100)}%)
+              </Button>
+            )}
+          </div>
+          
+          {stressTest.enabled && (
+            <Progress 
+              value={(stressTest.currentCount / stressTest.targetCount) * 100} 
+              className="h-2" 
+            />
+          )}
+          
+          {stressTest.timeStart && stressTest.timeEnd && (
+            <div className="text-xs text-muted-foreground">
+              Duration: {((stressTest.timeEnd - stressTest.timeStart) / 1000).toFixed(1)}s | 
+              Rate: {(stressTest.currentCount / ((stressTest.timeEnd - stressTest.timeStart) / 1000)).toFixed(1)} tx/s
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    );
+  };
+
+  // Main stats display
+  const StatsDisplay = () => {
+    return (
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center gap-2">
+            <BarChart3 className="h-5 w-5 text-purple-500" />
+            Network Stats
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex justify-between items-center">
+            <span className="text-muted-foreground">Active Atoms:</span>
+            <Badge variant="secondary" className="text-lg">{atoms.length}</Badge>
+          </div>
+          
+          <div className="flex justify-between items-center">
+            <span className="text-muted-foreground">Pending Tx:</span>
+            <Badge variant="outline" className={pendingTxCount > 0 ? "bg-amber-100 dark:bg-amber-900" : ""}>
+              {pendingTxCount}
+            </Badge>
+          </div>
+          
+          <Separator />
+          <WalletStatusDisplay />
+          
+          <div className="flex justify-between items-center">
+            <span className="text-muted-foreground">Total Transactions:</span>
+            <Badge variant="outline">{txCount}</Badge>
+          </div>
+          
+          <div className="flex justify-between items-center">
+            <span className="text-muted-foreground">Explosions:</span>
+            <Badge variant="outline" className="bg-red-100 dark:bg-red-900/30">{explosionCount}</Badge>
+          </div>
+          
+          <div className="flex justify-between items-center">
+            <span className="text-muted-foreground">Current TPS:</span>
+            <Badge 
+              variant={tps > 0 ? "default" : "outline"} 
+              className={tps > 50 ? "bg-green-500" : tps > 20 ? "bg-yellow-500" : ""}
+            >
+              {tps.toFixed(1)}
+            </Badge>
+          </div>
+          
+          <div className="flex justify-between items-center">
+            <span className="text-muted-foreground">Peak TPS:</span>
+            <Badge variant="default" className="bg-purple-500">
+              {peakTps.toFixed(1)}
+            </Badge>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  };
+
   return (
     <div className="flex flex-col items-center py-6 px-4 max-w-7xl mx-auto">
       <div className="w-full mb-6">
@@ -1067,7 +1403,7 @@ for (let i = 0; i < updatedAtoms.length; i++) {
           Break Somnia
         </h1>
         <p className="text-muted-foreground">
-          Click to add atoms, watch them collide and explode when energy reaches {MAX_ENERGY}
+          Stress test the Somnia Network by generating parallel atomic chain reactions
         </p>
       </div>
       
@@ -1081,115 +1417,84 @@ for (let i = 0; i < updatedAtoms.length; i++) {
                   <Atom className="h-5 w-5 text-blue-500" />
                   Lab Controls
                 </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Simulation controls */}
-              <div className="grid grid-cols-1 gap-2">
-                <Button 
-                  variant="outline" 
-                  onClick={() => {
-                    if (isPaused) {
-                      setIsPaused(false);
-                      toast.success("Reaction resumed");
-                    } else {
-                      const code = prompt("Enter nuclear code to pause reaction:");
-                      if (code === "91227") { 
-                        setIsPaused(true);
-                        toast.success("Reaction paused successfully");
-                      } else {
-                        toast.error("Invalid nuclear code");
-                      }
-                    }
-                  }}
-                  className="flex items-center justify-center gap-2"
-                >
-                  {isPaused ? <Play className="h-4 w-4" /> : <ZapOff className="h-4 w-4" />}
-                  {isPaused ? "Resume Reaction" : "Pause Reaction"}
-                </Button>
-              </div>
-              
-              <Separator />
-              
-              {/* Atom actions */}
-              <Button 
-                variant="default"
-                onClick={generateRandomAtoms}
-                className="w-full flex items-center gap-1"
-                disabled={atoms.length >= maxAtoms}
-              >
-                <Plus className="h-4 w-4" />
-                Start Stress Test
-              </Button>
-                            
-              <Separator />
-              
-              {/* Statistics toggle */}
-              <Button 
-                variant="outline"
-                onClick={() => setShowStats(!showStats)}
-                className="w-full flex items-center gap-1"
-              >
-                <BarChart3 className="h-4 w-4" />
-                {showStats ? 'Hide Stats' : 'Show Stats'}
-              </Button>
-            </CardContent>
-          </Card>
-          
-          {/* Stats card */}
-          {showStats && (
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="flex items-center gap-2">
-                  <BarChart3 className="h-5 w-5 text-purple-500" />
-                  Simulation Stats
-                </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="flex justify-between items-center">
-                  <span className="text-muted-foreground">Active Atoms:</span>
-                  <Badge variant="secondary" className="text-lg">{atoms.length}</Badge>
-                </div>
-                
-                <div className="flex justify-between items-center">
-                  <span className="text-muted-foreground">Pending Tx:</span>
-                  <Badge variant="outline" className={pendingTxCount > 0 ? "bg-amber-100 dark:bg-amber-900" : ""}>
-                    {pendingTxCount}
-                  </Badge>
+                {/* Simulation controls */}
+                <div className="grid grid-cols-1 gap-2">
+                  <Button 
+                    variant="outline" 
+                    onClick={() => {
+                      if (isPaused) {
+                        setIsPaused(false);
+                        toast.success("Reaction resumed");
+                      } else {
+                        setIsPaused(true);
+                        toast.success("Reaction paused");
+                      }
+                    }}
+                    className="flex items-center justify-center gap-2"
+                  >
+                    {isPaused ? <Play className="h-4 w-4" /> : <ZapOff className="h-4 w-4" />}
+                    {isPaused ? "Resume Reaction" : "Pause Reaction"}
+                  </Button>
                 </div>
                 
                 <Separator />
                 
-                <div className="flex justify-between items-center">
-                  <span className="text-muted-foreground">Total Transactions:</span>
-                  <Badge variant="outline">{txCount}</Badge>
-                </div>
+                {/* Atom actions */}
+                <Button 
+                  variant="default"
+                  onClick={generateRandomAtoms}
+                  className="w-full flex items-center gap-1"
+                  disabled={atoms.length >= maxAtoms || isPaused}
+                >
+                  <Plus className="h-4 w-4" />
+                  Add Random Atoms
+                </Button>
                 
-                <div className="flex justify-between items-center">
-                  <span className="text-muted-foreground">TPS:</span>
-                  <Badge 
-                    variant={tps > 0 ? "default" : "outline"} 
-                    className={tps > 10 ? "bg-green-500" : tps > 5 ? "bg-yellow-500" : ""}
-                  >
-                    {tps.toFixed(1)}
-                  </Badge>
-                </div>
+                <Button 
+                  variant="outline"
+                  onClick={clearAtoms}
+                  className="w-full flex items-center gap-1"
+                  disabled={atoms.length === 0 || isPaused}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Clear All Atoms
+                </Button>
+                
+                <Separator />
+                
+                {/* Statistics toggle */}
+                <Button 
+                  variant="outline"
+                  onClick={() => setShowStats(!showStats)}
+                  className="w-full flex items-center gap-1"
+                >
+                  <BarChart3 className="h-4 w-4" />
+                  {showStats ? 'Hide Stats' : 'Show Stats'}
+                </Button>
               </CardContent>
             </Card>
-          )}
-          
-          {/* Transactions log */}
-          <Card className="h-80 overflow-hidden">
-            <CardHeader className="pb-2">
-              <CardTitle className="flex items-center gap-2">
-                <RotateCw className="h-5 w-5 text-green-500" />
-                Recent Transactions
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-            <TransactionsList />
-            </CardContent>
-          </Card>
-        </div>
+            
+            {/* Stats card */}
+            {showStats && <StatsDisplay />}
+            
+            {/* Stress test controls */}
+            <StressTestControls />
+            
+            {/* Transactions log */}
+            <Card className="h-80 overflow-hidden">
+              <CardHeader className="pb-2">
+                <CardTitle className="flex items-center gap-2">
+                  <RotateCw className="h-5 w-5 text-green-500" />
+                  Recent Transactions
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <TransactionsList />
+              </CardContent>
+            </Card>
+          </div>
         </div>
         
         {/* Main simulation area */}
@@ -1201,7 +1506,7 @@ for (let i = 0; i < updatedAtoms.length; i++) {
               height={CANVAS_HEIGHT} 
               onClick={handleCanvasClick}
               className="w-full h-full border-2 border-gray-300 rounded-md cursor-pointer"
-              />
+            />
             
             <div className="mt-2 text-center text-sm text-muted-foreground">
               Click anywhere in the lab to add an atom. Atoms gain energy when they collide and explode at {MAX_ENERGY} energy.
